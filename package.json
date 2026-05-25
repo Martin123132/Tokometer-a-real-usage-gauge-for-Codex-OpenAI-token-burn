@@ -1,0 +1,42 @@
+{
+  "name": "tokometer",
+  "private": false,
+  "version": "0.1.0",
+  "description": "A real local usage gauge for Codex token burn, rate limits, history, alerts, and exports.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "start": "npm run build && tsx server/standalone.ts",
+    "serve": "tsx server/standalone.ts",
+    "desktop": "node scripts/desktop.mjs",
+    "preview": "vite preview"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Martin123132/Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn.git"
+  },
+  "dependencies": {
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.12.3",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "electron": "^42.2.0",
+    "eslint": "^10.3.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.6.0",
+    "tsx": "^4.22.3",
+    "typescript": "~6.0.2",
+    "typescript-eslint": "^8.59.2",
+    "vite": "^8.0.12",
+    "vitest": "^4.1.7"
+  }
+}

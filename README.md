@@ -1,1 +1,141 @@
-# Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn.
+# Tokometer
+
+A real local usage gauge for Codex token burn.
+
+Tokometer reads local Codex `token_count` metadata and turns it into an instrument-cluster dashboard: weekly usage, 5-hour window, burn rate, cached vs active tokens, history, alerts, reports, and heaviest sessions.
+
+## Screenshots
+
+![Tokometer dashboard with 5h app meter override](docs/images/tokometer-dashboard.png)
+
+![Tokometer alerts and known-vs-estimated meter comparison](docs/images/tokometer-alerts.png)
+
+Repo target:
+
+```text
+Martin123132/Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn.
+```
+
+## What It Reads
+
+Tokometer scans these local Codex folders by default:
+
+```text
+~/.codex/sessions
+~/.codex/archived_sessions
+```
+
+It parses only structured `token_count` JSONL events. It does not need to read full chat text to calculate the gauge.
+
+## Quick Start
+
+```bash
+npm install
+npm run dev
+```
+
+Open:
+
+```text
+http://127.0.0.1:5173
+```
+
+## Desktop Mode
+
+```bash
+npm run desktop
+```
+
+This starts the local Vite server and opens Tokometer in an Electron shell with a tray menu where supported.
+
+## Production Web Server
+
+```bash
+npm run start
+```
+
+This builds the app and serves the production bundle with the local `/api/usage` endpoint.
+
+## Scripts
+
+```bash
+npm run dev       # Vite dev server with local usage API
+npm run desktop   # Electron desktop wrapper
+npm run build     # TypeScript + Vite production build
+npm run serve     # Serve an existing dist build
+npm run test      # Parser/unit tests
+npm run lint      # ESLint
+```
+
+## Portable Paths
+
+Tokometer auto-detects the Codex home folder as `~/.codex`.
+
+Override it when needed:
+
+```bash
+TOKEN_GAUGE_CODEX_HOME=/path/to/.codex npm run dev
+```
+
+Persistent history is stored outside the repo:
+
+- Windows: `%APPDATA%/Token Gauge/history.jsonl`
+- macOS: `~/Library/Application Support/Token Gauge/history.jsonl`
+- Linux: `$XDG_DATA_HOME/token-gauge/history.jsonl` or `~/.local/share/token-gauge/history.jsonl`
+
+Override the history folder:
+
+```bash
+TOKEN_GAUGE_DATA_DIR=/path/to/tokometer-data npm run dev
+```
+
+## Known vs Estimated
+
+Known metadata:
+
+- Codex-provided token totals, cached input counts, output counts, reasoning counts, context window, rate-limit percentages, and reset timestamps when present.
+- Per-session cumulative deltas, so repeated `token_count` UI refreshes are not double-counted.
+
+Estimated or local:
+
+- Burn rate is based on recently observed local metadata.
+- Active burn is calculated as uncached input + output + reasoning.
+- Projection assumes the recent weekly percentage trend continues.
+
+Important caveat: the visible ChatGPT/Codex app meter can include activity Tokometer cannot see locally, or update on a different cadence. Use the `5h App Meter` and `Weekly App Meter` fields to compare the visible app numbers against local metadata.
+
+## Exports
+
+Use the `JSON` and `Report` buttons in the dashboard to export:
+
+- Raw usage summary JSON
+- Markdown report with current limits, burn, alerts, and caveats
+
+## Development Notes
+
+The parser lives in:
+
+```text
+server/usage.ts
+```
+
+Tests live in:
+
+```text
+server/usage.test.ts
+```
+
+The Vite dev server exposes:
+
+```text
+/api/health
+/api/usage
+```
+
+## Privacy
+
+Tokometer is local-first. It does not send your Codex logs anywhere. The dashboard fetches from a local API served by the app process.
+
+## License
+
+MIT
