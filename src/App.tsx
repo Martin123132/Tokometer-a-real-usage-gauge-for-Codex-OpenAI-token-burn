@@ -109,7 +109,23 @@ type UsageData = {
   }
 }
 
-const dangerZone = 82
+type ViewMode = 'dashboard' | 'settings'
+
+type AppSettings = {
+  refreshSeconds: number
+  dangerThreshold: number
+  mismatchThreshold: number
+  activeBurnScale: number
+}
+
+const defaultSettings: AppSettings = {
+  refreshSeconds: 60,
+  dangerThreshold: 82,
+  mismatchThreshold: 8,
+  activeBurnScale: 240_000,
+}
+
+const settingsStorageKey = 'tokometer-settings-v1'
 const primaryMeterStorageKey = 'tokometer-primary-meter'
 const legacyPrimaryMeterStorageKey = 'token-gauge-primary-meter'
 const weeklyMeterStorageKey = 'tokometer-weekly-meter'
@@ -119,6 +135,8 @@ function App() {
   const [data, setData] = useState<UsageData | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [viewMode, setViewMode] = useState<ViewMode>('dashboard')
+  const [settings, setSettings] = useState(loadSettings)
   const [meterOverride, setMeterOverride] = useState(() => {
     return (
       window.localStorage.getItem(weeklyMeterStorageKey) ??
@@ -158,12 +176,19 @@ function App() {
 
   useEffect(() => {
     const firstRun = window.setTimeout(() => void refresh(), 0)
-    const timer = window.setInterval(() => void refresh(), 60_000)
+    const timer = window.setInterval(
+      () => void refresh(),
+      settings.refreshSeconds * 1000,
+    )
     return () => {
       window.clearTimeout(firstRun)
       window.clearInterval(timer)
     }
-  }, [])
+  }, [settings.refreshSeconds])
+
+  useEffect(() => {
+    window.localStorage.setItem(settingsStorageKey, JSON.stringify(settings))
+  }, [settings])
 
   const weeklyPercent = data?.limits.secondary.usedPercent ?? 0
   const visibleMeter = resolveVisibleMeter(meterOverride, weeklyPercent)
@@ -174,12 +199,43 @@ function App() {
   )
   const activeBurnHour = data?.windows.lastHour.activeTokens ?? 0
   const burnScore = useMemo(() => {
-    return Math.min(100, Math.round((activeBurnHour / 240_000) * 100))
-  }, [activeBurnHour])
+    return Math.min(100, Math.round((activeBurnHour / settings.activeBurnScale) * 100))
+  }, [activeBurnHour, settings.activeBurnScale])
   const alerts = useMemo(
-    () => buildClientAlerts(data, visibleMeter, visiblePrimaryMeter),
-    [data, visibleMeter, visiblePrimaryMeter],
+    () => buildClientAlerts(data, visibleMeter, visiblePrimaryMeter, settings),
+    [data, visibleMeter, visiblePrimaryMeter, settings],
   )
+
+  const setPrimaryMeterValue = (nextValue: string) => {
+    setPrimaryMeterOverride(nextValue)
+    if (nextValue === '') {
+      window.localStorage.removeItem(primaryMeterStorageKey)
+      window.localStorage.removeItem(legacyPrimaryMeterStorageKey)
+    } else {
+      window.localStorage.setItem(primaryMeterStorageKey, nextValue)
+      window.localStorage.removeItem(legacyPrimaryMeterStorageKey)
+    }
+  }
+
+  const setWeeklyMeterValue = (nextValue: string) => {
+    setMeterOverride(nextValue)
+    if (nextValue === '') {
+      window.localStorage.removeItem(weeklyMeterStorageKey)
+      window.localStorage.removeItem(legacyWeeklyMeterStorageKey)
+    } else {
+      window.localStorage.setItem(weeklyMeterStorageKey, nextValue)
+      window.localStorage.removeItem(legacyWeeklyMeterStorageKey)
+    }
+  }
+
+  const resetMeterOverrides = () => {
+    setPrimaryMeterValue('')
+    setWeeklyMeterValue('')
+  }
+
+  const resetSettings = () => {
+    setSettings(defaultSettings)
+  }
 
   if (!data && loading) {
     return <LoadingPanel />
@@ -202,9 +258,18 @@ function App() {
     <div className="app-shell">
       <aside className="rail" aria-label="Token gauge sections">
         <div className="brand-mark">TK</div>
-        <RailIcon label="Gauges" active path="M12 5a7 7 0 0 1 7 7v2h-3v-2a4 4 0 0 0-8 0v2H5v-2a7 7 0 0 1 7-7Zm-1 9h2v5h-2v-5Z" />
-        <RailIcon label="Timeline" path="M4 17h16v2H4v-2Zm1-6h4v4H5v-4Zm5-6h4v10h-4V5Zm5 3h4v7h-4V8Z" />
-        <RailIcon label="Sessions" path="M5 5h14v3H5V5Zm0 5h14v3H5v-3Zm0 5h14v4H5v-4Z" />
+        <RailIcon
+          label="Dashboard"
+          active={viewMode === 'dashboard'}
+          path="M12 5a7 7 0 0 1 7 7v2h-3v-2a4 4 0 0 0-8 0v2H5v-2a7 7 0 0 1 7-7Zm-1 9h2v5h-2v-5Z"
+          onClick={() => setViewMode('dashboard')}
+        />
+        <RailIcon
+          label="Settings"
+          active={viewMode === 'settings'}
+          path="M12 8.6a3.4 3.4 0 1 1 0 6.8 3.4 3.4 0 0 1 0-6.8Zm7.1 2.7 1.7 1.3-1.6 2.8-2.1-.8a6 6 0 0 1-1.4.8l-.3 2.2h-3.2l-.3-2.2a6 6 0 0 1-1.4-.8l-2.1.8-1.6-2.8 1.7-1.3a6 6 0 0 1 0-1.6L6.8 8.4l1.6-2.8 2.1.8a6 6 0 0 1 1.4-.8l.3-2.2h3.2l.3 2.2a6 6 0 0 1 1.4.8l2.1-.8 1.6 2.8-1.7 1.3a6 6 0 0 1 0 1.6Z"
+          onClick={() => setViewMode('settings')}
+        />
       </aside>
 
       <main className="dashboard">
@@ -238,6 +303,20 @@ function App() {
 
         {error ? <div className="inline-error">{error}</div> : null}
 
+        {viewMode === 'settings' ? (
+          <SettingsView
+            data={data}
+            settings={settings}
+            onSettingsChange={setSettings}
+            primaryMeterOverride={primaryMeterOverride}
+            weeklyMeterOverride={meterOverride}
+            onPrimaryMeterChange={setPrimaryMeterValue}
+            onWeeklyMeterChange={setWeeklyMeterValue}
+            onResetMeters={resetMeterOverrides}
+            onResetSettings={resetSettings}
+          />
+        ) : (
+          <>
         <section className="cluster-grid">
           <section className="instrument-panel main-cluster">
             <Gauge
@@ -245,14 +324,14 @@ function App() {
               value={visibleMeter}
               valueLabel={`${Math.round(visibleMeter)}%`}
               sublabel={`Resets ${formatDate(data?.limits.secondary.resetsAt)}`}
-              tone={visibleMeter >= dangerZone ? 'danger' : 'cyan'}
+              tone={visibleMeter >= settings.dangerThreshold ? 'danger' : 'cyan'}
             />
             <Gauge
               label="Burn Rate"
               value={burnScore}
               valueLabel={`${formatTokens(activeBurnHour)}/hr`}
               sublabel={`${formatTokens(data?.windows.lastHour.totalTokens ?? 0)} total incl. cached`}
-              tone={burnScore >= dangerZone ? 'danger' : 'amber'}
+              tone={burnScore >= settings.dangerThreshold ? 'danger' : 'amber'}
             />
           </section>
 
@@ -276,16 +355,7 @@ function App() {
               metadataPercent={primaryPercent}
               value={primaryMeterOverride}
               visibleMeter={visiblePrimaryMeter}
-              onChange={(nextValue) => {
-                setPrimaryMeterOverride(nextValue)
-                if (nextValue === '') {
-                  window.localStorage.removeItem(primaryMeterStorageKey)
-                  window.localStorage.removeItem(legacyPrimaryMeterStorageKey)
-                } else {
-                  window.localStorage.setItem(primaryMeterStorageKey, nextValue)
-                  window.localStorage.removeItem(legacyPrimaryMeterStorageKey)
-                }
-              }}
+              onChange={setPrimaryMeterValue}
             />
             <MeterReconcile
               id="visible-weekly-meter"
@@ -294,16 +364,7 @@ function App() {
               metadataPercent={weeklyPercent}
               value={meterOverride}
               visibleMeter={visibleMeter}
-              onChange={(nextValue) => {
-                setMeterOverride(nextValue)
-                if (nextValue === '') {
-                  window.localStorage.removeItem(weeklyMeterStorageKey)
-                  window.localStorage.removeItem(legacyWeeklyMeterStorageKey)
-                } else {
-                  window.localStorage.setItem(weeklyMeterStorageKey, nextValue)
-                  window.localStorage.removeItem(legacyWeeklyMeterStorageKey)
-                }
-              }}
+              onChange={setWeeklyMeterValue}
             />
             <div className="projection">
               <span>Projected</span>
@@ -366,6 +427,8 @@ function App() {
           </div>
           <SessionTable sessions={data?.topSessions ?? []} />
         </section>
+          </>
+        )}
       </main>
     </div>
   )
@@ -384,18 +447,238 @@ function LoadingPanel() {
 function RailIcon({
   label,
   path,
+  onClick,
   active = false,
 }: {
   label: string
   path: string
+  onClick: () => void
   active?: boolean
 }) {
   return (
-    <button className={active ? 'rail-button active' : 'rail-button'} title={label}>
+    <button
+      className={active ? 'rail-button active' : 'rail-button'}
+      title={label}
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+    >
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path d={path} />
       </svg>
     </button>
+  )
+}
+
+function SettingsView({
+  data,
+  settings,
+  onSettingsChange,
+  primaryMeterOverride,
+  weeklyMeterOverride,
+  onPrimaryMeterChange,
+  onWeeklyMeterChange,
+  onResetMeters,
+  onResetSettings,
+}: {
+  data: UsageData | null
+  settings: AppSettings
+  onSettingsChange: (settings: AppSettings) => void
+  primaryMeterOverride: string
+  weeklyMeterOverride: string
+  onPrimaryMeterChange: (value: string) => void
+  onWeeklyMeterChange: (value: string) => void
+  onResetMeters: () => void
+  onResetSettings: () => void
+}) {
+  const primaryPercent = data?.limits.primary.usedPercent ?? 0
+  const weeklyPercent = data?.limits.secondary.usedPercent ?? 0
+  const visiblePrimaryMeter = resolveVisibleMeter(primaryMeterOverride, primaryPercent)
+  const visibleWeeklyMeter = resolveVisibleMeter(weeklyMeterOverride, weeklyPercent)
+  const codexHome = data?.source.codexHome ?? '~/.codex'
+  const dataDir = data?.source.dataDir ?? 'System app data folder'
+  const updateSetting = (patch: Partial<AppSettings>) => {
+    onSettingsChange({ ...settings, ...patch })
+  }
+
+  return (
+    <section className="settings-grid">
+      <section className="instrument-panel settings-panel settings-wide">
+        <div className="panel-heading">
+          <h2>Settings</h2>
+          <span>Local preferences</span>
+        </div>
+        <div className="settings-controls">
+          <SettingNumberField
+            id="refresh-seconds"
+            label="Refresh"
+            suffix="sec"
+            min={15}
+            max={600}
+            step={15}
+            value={settings.refreshSeconds}
+            onChange={(value) => updateSetting({ refreshSeconds: value })}
+          />
+          <SettingNumberField
+            id="danger-threshold"
+            label="Danger"
+            suffix="%"
+            min={50}
+            max={100}
+            step={1}
+            value={settings.dangerThreshold}
+            onChange={(value) => updateSetting({ dangerThreshold: value })}
+          />
+          <SettingNumberField
+            id="mismatch-threshold"
+            label="Mismatch"
+            suffix="pts"
+            min={1}
+            max={50}
+            step={1}
+            value={settings.mismatchThreshold}
+            onChange={(value) => updateSetting({ mismatchThreshold: value })}
+          />
+          <SettingNumberField
+            id="active-burn-scale"
+            label="Burn Scale"
+            suffix="tokens/hr"
+            min={10_000}
+            max={10_000_000}
+            step={10_000}
+            value={settings.activeBurnScale}
+            onChange={(value) => updateSetting({ activeBurnScale: value })}
+          />
+        </div>
+        <div className="settings-actions">
+          <button type="button" onClick={onResetSettings}>
+            Restore Defaults
+          </button>
+        </div>
+      </section>
+
+      <section className="instrument-panel settings-panel meter-settings-panel">
+        <div className="panel-heading">
+          <h2>App Meters</h2>
+          <span>Visible vs local</span>
+        </div>
+        <MeterReconcile
+          id="settings-primary-meter"
+          label="5h App Meter"
+          shortLabel="5h app"
+          metadataPercent={primaryPercent}
+          value={primaryMeterOverride}
+          visibleMeter={visiblePrimaryMeter}
+          onChange={onPrimaryMeterChange}
+        />
+        <MeterReconcile
+          id="settings-weekly-meter"
+          label="Weekly App Meter"
+          shortLabel="weekly app"
+          metadataPercent={weeklyPercent}
+          value={weeklyMeterOverride}
+          visibleMeter={visibleWeeklyMeter}
+          onChange={onWeeklyMeterChange}
+        />
+        <div className="settings-actions">
+          <button type="button" onClick={onResetMeters}>
+            Clear App Meters
+          </button>
+        </div>
+      </section>
+
+      <section className="instrument-panel settings-panel settings-wide">
+        <div className="panel-heading">
+          <h2>Runtime Paths</h2>
+          <span>Restart-time overrides</span>
+        </div>
+        <div className="path-stack">
+          <PathLine label="Codex home" value={codexHome} />
+          <PathLine label="History store" value={dataDir} />
+          <CommandLine label="Codex env" value={`TOKEN_GAUGE_CODEX_HOME=${quoteShellValue(codexHome)}`} />
+          <CommandLine label="History env" value={`TOKEN_GAUGE_DATA_DIR=${quoteShellValue(dataDir)}`} />
+        </div>
+      </section>
+
+      <section className="instrument-panel settings-panel">
+        <div className="panel-heading">
+          <h2>Package</h2>
+          <span>Desktop build</span>
+        </div>
+        <div className="release-list">
+          <ReleaseLine label="Dev shell" value="npm run desktop" />
+          <ReleaseLine label="Prod shell" value="npm run desktop:prod" />
+          <ReleaseLine label="Installer" value="npm run dist" />
+        </div>
+      </section>
+    </section>
+  )
+}
+
+function SettingNumberField({
+  id,
+  label,
+  suffix,
+  min,
+  max,
+  step,
+  value,
+  onChange,
+}: {
+  id: string
+  label: string
+  suffix: string
+  min: number
+  max: number
+  step: number
+  value: number
+  onChange: (value: number) => void
+}) {
+  return (
+    <label className="settings-field" htmlFor={id}>
+      <span>{label}</span>
+      <div>
+        <input
+          id={id}
+          type="number"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          onChange={(event) => {
+            onChange(boundNumber(Number(event.currentTarget.value), min, max, value))
+          }}
+        />
+        <em>{suffix}</em>
+      </div>
+    </label>
+  )
+}
+
+function PathLine({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="path-line">
+      <span>{label}</span>
+      <code>{value}</code>
+    </div>
+  )
+}
+
+function CommandLine({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="command-line">
+      <span>{label}</span>
+      <code>{value}</code>
+    </div>
+  )
+}
+
+function ReleaseLine({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="release-line">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
   )
 }
 
@@ -795,6 +1078,7 @@ function buildClientAlerts(
   data: UsageData | null,
   visibleMeter: number,
   visiblePrimaryMeter: number,
+  settings: AppSettings,
 ): GaugeAlert[] {
   if (!data) {
     return []
@@ -806,7 +1090,7 @@ function buildClientAlerts(
   const weeklyMetadataPercent = data.limits.secondary.usedPercent ?? 0
   const weeklyDelta = visibleMeter - weeklyMetadataPercent
 
-  if (Number.isFinite(weeklyDelta) && Math.abs(weeklyDelta) >= 8) {
+  if (Number.isFinite(weeklyDelta) && Math.abs(weeklyDelta) >= settings.mismatchThreshold) {
     alerts.unshift({
       id: 'weekly-meter-mismatch',
       severity: 'warning',
@@ -815,7 +1099,7 @@ function buildClientAlerts(
     })
   }
 
-  if (Number.isFinite(primaryDelta) && Math.abs(primaryDelta) >= 8) {
+  if (Number.isFinite(primaryDelta) && Math.abs(primaryDelta) >= settings.mismatchThreshold) {
     alerts.unshift({
       id: 'primary-meter-mismatch',
       severity: 'warning',
@@ -978,6 +1262,13 @@ function clamp(value: number) {
   return Math.max(0, Math.min(100, value))
 }
 
+function boundNumber(value: number, min: number, max: number, fallback: number) {
+  if (!Number.isFinite(value)) {
+    return fallback
+  }
+  return Math.max(min, Math.min(max, value))
+}
+
 function resolveVisibleMeter(override: string, metadataPercent: number) {
   if (override === '') {
     return metadataPercent
@@ -985,6 +1276,49 @@ function resolveVisibleMeter(override: string, metadataPercent: number) {
 
   const parsed = Number(override)
   return Number.isFinite(parsed) ? clamp(parsed) : metadataPercent
+}
+
+function loadSettings(): AppSettings {
+  const storedSettings = window.localStorage.getItem(settingsStorageKey)
+  if (!storedSettings) {
+    return defaultSettings
+  }
+
+  try {
+    const parsed = JSON.parse(storedSettings) as Partial<AppSettings>
+    return {
+      refreshSeconds: boundNumber(
+        Number(parsed.refreshSeconds),
+        15,
+        600,
+        defaultSettings.refreshSeconds,
+      ),
+      dangerThreshold: boundNumber(
+        Number(parsed.dangerThreshold),
+        50,
+        100,
+        defaultSettings.dangerThreshold,
+      ),
+      mismatchThreshold: boundNumber(
+        Number(parsed.mismatchThreshold),
+        1,
+        50,
+        defaultSettings.mismatchThreshold,
+      ),
+      activeBurnScale: boundNumber(
+        Number(parsed.activeBurnScale),
+        10_000,
+        10_000_000,
+        defaultSettings.activeBurnScale,
+      ),
+    }
+  } catch {
+    return defaultSettings
+  }
+}
+
+function quoteShellValue(value: string) {
+  return `"${value.replace(/"/g, '\\"')}"`
 }
 
 function polarToCartesian(cx: number, cy: number, radius: number, angle: number) {

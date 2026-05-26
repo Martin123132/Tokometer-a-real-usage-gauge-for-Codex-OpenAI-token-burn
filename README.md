@@ -10,6 +10,8 @@ Tokometer reads local Codex `token_count` metadata and turns it into an instrume
 
 ![Tokometer alerts and known-vs-estimated meter comparison](docs/images/tokometer-alerts.png)
 
+![Tokometer settings view](docs/images/tokometer-settings.png)
+
 Repo target:
 
 ```text
@@ -48,6 +50,14 @@ npm run desktop
 
 This starts the local Vite server and opens Tokometer in an Electron shell with a tray menu where supported.
 
+For a production-style desktop smoke test:
+
+```bash
+npm run desktop:prod
+```
+
+This builds the client and local parser bundle, then opens Electron against its bundled local server.
+
 ## Production Web Server
 
 ```bash
@@ -61,11 +71,26 @@ This builds the app and serves the production bundle with the local `/api/usage`
 ```bash
 npm run dev       # Vite dev server with local usage API
 npm run desktop   # Electron desktop wrapper
+npm run desktop:prod # Production-style Electron wrapper
 npm run build     # TypeScript + Vite production build
+npm run pack      # Build unpacked desktop app into release/
+npm run dist      # Build installable desktop artifacts into release/
 npm run serve     # Serve an existing dist build
 npm run test      # Parser/unit tests
 npm run lint      # ESLint
 ```
+
+## Settings
+
+The Settings view stores local UI preferences in browser/Electron local storage:
+
+- Refresh interval
+- Gauge danger threshold
+- Visible-vs-local mismatch threshold
+- Burn-rate full-scale value
+- 5h and weekly app meter overrides
+
+Runtime paths are still process-level settings. Set `TOKEN_GAUGE_CODEX_HOME` or `TOKEN_GAUGE_DATA_DIR` before starting Tokometer when you need to scan or store data somewhere else.
 
 ## Portable Paths
 
@@ -110,6 +135,18 @@ Use the `JSON` and `Report` buttons in the dashboard to export:
 
 - Raw usage summary JSON
 - Markdown report with current limits, burn, alerts, and caveats
+
+## Release Builds
+
+Manual GitHub packaging is defined in `.github/workflows/package.yml`.
+
+Locally:
+
+```bash
+npm run dist
+```
+
+Artifacts are written to `release/`.
 
 ## Development Notes
 
