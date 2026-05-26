@@ -18,13 +18,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: source
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
+          cache-dependency-path: source/package-lock.json
       - run: npm ci
+        working-directory: source
       - run: npm run dist
+        working-directory: source
       - uses: actions/upload-artifact@v4
         with:
           name: tokometer-${{ runner.os }}
-          path: release/**
+          path: source/release/**

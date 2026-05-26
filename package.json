@@ -3,7 +3,7 @@
   "private": false,
   "version": "0.1.0",
   "description": "A real local usage gauge for Codex token burn, rate limits, history, alerts, and exports.",
-  "author": "Martin123132",
+  "author": "Martin123132 <Martin123132@users.noreply.github.com>",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -19,7 +19,7 @@
     "desktop:prod": "npm run build && electron electron/main.cjs",
     "preview": "vite preview",
     "pack": "npm run build && electron-builder --dir",
-    "dist": "npm run build && electron-builder"
+    "dist": "npm run build && electron-builder --publish never"
   },
   "repository": {
     "type": "git",
@@ -96,6 +96,7 @@
         "AppImage",
         "deb"
       ],
+      "maintainer": "Martin123132 <Martin123132@users.noreply.github.com>",
       "category": "Development"
     }
   }
