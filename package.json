@@ -23,11 +23,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Martin123132/Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn..git"
+    "url": "git+https://github.com/Martin123132/Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn.git"
   },
-  "homepage": "https://github.com/Martin123132/Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn.",
+  "homepage": "https://github.com/Martin123132/Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn",
   "bugs": {
-    "url": "https://github.com/Martin123132/Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn./issues"
+    "url": "https://github.com/Martin123132/Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn/issues"
   },
   "dependencies": {
     "react": "^19.2.6",

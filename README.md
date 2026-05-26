@@ -15,7 +15,7 @@ Tokometer reads local Codex `token_count` metadata and turns it into an instrume
 Repo target:
 
 ```text
-Martin123132/Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn.
+Martin123132/Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn
 ```
 
 ## What It Reads
