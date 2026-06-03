@@ -1351,30 +1351,44 @@ function projectPercent(events: TokenEvent[], now: number): PercentProjection {
       yMean + trendPerMs * (point.x - xMean)
     return Math.abs(expected - point.y)
   })
+  const squaredResiduals = residuals.map((value) => value * value)
+  const totalSquared = smoothed.reduce(
+    (sum, point) => sum + (point.y - yMean) ** 2,
+    0,
+  )
+  const residualSumSquares = squaredResiduals.reduce((sum, value) => sum + value, 0)
+  const rSquared = totalSquared > 0 ? 1 - residualSumSquares / totalSquared : 0
   const averageResidual = residuals.reduce((sum, value) => sum + value, 0) / residuals.length
+  const staleWindowMinutes = Math.max(0, (now - smoothed.at(-1)!.x) / 60000)
+  const latestSampleFresh = staleWindowMinutes <= 60
 
   const finalWindow = smoothed.at(-1)!
   const finalValue = finalWindow.y
-
   const confidence =
-    smoothed.length >= 8 && averageResidual <= 2.4 && percentPerHour > 0
+    smoothed.length >= 8 &&
+    averageResidual <= 2.4 &&
+    percentPerHour > 0 &&
+    rSquared >= 0.82 &&
+    latestSampleFresh
       ? {
           level: 'high' as const,
           score: 0.88,
-          reason:
-            'Strong short-history linear trend across recent percent samples.',
+          reason: `Strong recent trend fit (${Math.round(rSquared * 100)}% R², avg residual ${averageResidual.toFixed(1)}).`,
         }
-      : smoothed.length >= 5 && averageResidual <= 4.5
+      : smoothed.length >= 5 &&
+          averageResidual <= 4.5 &&
+          rSquared >= 0.5 &&
+          latestSampleFresh
         ? {
             level: 'medium' as const,
             score: 0.64,
-            reason: 'Moderate trend confidence; estimate is directional.',
-          }
+            reason: `Moderate trend fit (${Math.round(rSquared * 100)}% R², avg residual ${averageResidual.toFixed(1)}).`,
+        }
         : {
             level: 'low' as const,
             score: 0.24,
             reason: 'Trend residuals are noisy; no reliable percent trend.',
-          }
+        }
 
   if (percentPerHour <= 0) {
     return {

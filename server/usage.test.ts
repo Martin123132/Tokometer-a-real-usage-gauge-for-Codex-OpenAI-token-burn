@@ -578,6 +578,37 @@ describe('projection confidence', () => {
     expect(projection.basisHours).toBeNull()
     expect(projection.confidence.level).toBe('low')
   })
+
+  it('downgrades projection confidence when latest weekly sample is stale', async () => {
+    const lines = [
+      ...Array.from({ length: 6 }, (_, index) => {
+        const minute = index * 1800_000
+        const usedPercent = 20 + index * 2
+        return tokenLineWithBuckets(
+          new Date(Date.parse('2026-05-25T08:00:00.000Z') + minute).toISOString(),
+          {
+            total: bucket(100 + index * 60, 30, 20, 5, 155 + index * 60),
+            last: bucket(100 + index * 60, 30, 20, 5, 155 + index * 60),
+          },
+          10 + index,
+          usedPercent,
+        )
+      }),
+    ]
+
+    const { codexHome, dataDir } = await createFixture(lines)
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T12:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.rates.weeklyPercent.confidence.level).toBe('low')
+    expect(summary.rates.weeklyPercent.projectedExhaustAt).toBeNull()
+    expect(summary.rates.weeklyPercent.percentPerHour).toBeNull()
+  })
 })
 
 async function createFixture(lines: string[]) {
