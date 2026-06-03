@@ -978,15 +978,34 @@ function parseTotals(
   const info = payloadInfo as Record<string, unknown>
   const totalTotals = normalizeBucket(info.total_token_usage)
   if (hasAnyTotals(totalTotals)) {
-    return { totals: totalTotals, source: 'total' }
+    return { totals: ensureTotalTokenCount(totalTotals), source: 'total' }
   }
 
   const lastTotals = normalizeBucket(info.last_token_usage)
   if (hasAnyTotals(lastTotals)) {
-    return { totals: lastTotals, source: 'last' }
+    return { totals: ensureTotalTokenCount(lastTotals), source: 'last' }
   }
 
   return null
+}
+
+function ensureTotalTokenCount(bucket: TokenBucket): TokenBucket {
+  if (bucket.total_tokens !== undefined) {
+    return bucket
+  }
+
+  const inferred = Math.max(
+    0,
+    (bucket.input_tokens ?? 0) +
+      (bucket.cached_input_tokens ?? 0) +
+      (bucket.output_tokens ?? 0) +
+      (bucket.reasoning_output_tokens ?? 0),
+  )
+
+  return {
+    ...bucket,
+    total_tokens: inferred,
+  }
 }
 
 function hasAnyTotals(bucket: TokenBucket): boolean {

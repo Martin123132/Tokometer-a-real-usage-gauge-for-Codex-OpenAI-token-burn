@@ -73,6 +73,122 @@ describe('usage parser', () => {
     expect(summary.windows.lastHour.cachedInputTokens).toBe(90)
   })
 
+  it('infers missing total_tokens from available component fields', async () => {
+    const { codexHome, dataDir } = await createFixture([
+      tokenLineWithBuckets(
+        '2026-05-25T10:00:00.000Z',
+        {
+          total: {
+            input_tokens: 1000,
+            cached_input_tokens: 650,
+            output_tokens: 140,
+            reasoning_output_tokens: 20,
+          },
+          last: {
+            input_tokens: 1000,
+            cached_input_tokens: 650,
+            output_tokens: 140,
+            reasoning_output_tokens: 20,
+          },
+        },
+        44,
+        91,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:05:00.000Z',
+        {
+          total: {
+            input_tokens: 1850,
+            cached_input_tokens: 1200,
+            output_tokens: 140,
+            reasoning_output_tokens: 20,
+          },
+          last: {
+            input_tokens: 1850,
+            cached_input_tokens: 1200,
+            output_tokens: 140,
+            reasoning_output_tokens: 20,
+          },
+        },
+        45,
+        92,
+      ),
+    ])
+
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.windows.lastHour.totalTokens).toBe(1400)
+    expect(summary.windows.lastHour.cachedInputTokens).toBe(550)
+    expect(summary.windows.lastHour.uncachedInputTokens).toBe(300)
+    expect(summary.windows.lastHour.activeTokens).toBe(300)
+  })
+
+  it('parses numeric token counts passed as strings', async () => {
+    const { codexHome, dataDir } = await createFixture([
+      tokenLineWithBuckets(
+        '2026-05-25T10:00:00.000Z',
+        {
+          total: {
+            input_tokens: '100',
+            cached_input_tokens: '10',
+            output_tokens: '20',
+            reasoning_output_tokens: '5',
+            total_tokens: '135',
+          },
+          last: {
+            input_tokens: '100',
+            cached_input_tokens: '10',
+            output_tokens: '20',
+            reasoning_output_tokens: '5',
+            total_tokens: '135',
+          },
+        },
+        44,
+        91,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:10:00.000Z',
+        {
+          total: {
+            input_tokens: '200',
+            cached_input_tokens: '10',
+            output_tokens: '45',
+            reasoning_output_tokens: '5',
+            total_tokens: '260',
+          },
+          last: {
+            input_tokens: '200',
+            cached_input_tokens: '10',
+            output_tokens: '45',
+            reasoning_output_tokens: '5',
+            total_tokens: '260',
+          },
+        },
+        45,
+        92,
+      ),
+    ])
+
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.windows.lastHour.totalTokens).toBe(125)
+    expect(summary.windows.lastHour.activeTokens).toBe(125)
+    expect(summary.windows.lastHour.uncachedInputTokens).toBe(100)
+    expect(summary.windows.lastHour.cachedInputTokens).toBe(0)
+  })
+
   it('skips partial JSON lines and records history once per minute', async () => {
     const { codexHome, dataDir } = await createFixture([
       tokenLine('2026-05-25T10:00:00.000Z', 100, 25, 40, 5, 145, 91, 88),
@@ -197,6 +313,33 @@ describe('usage parser', () => {
     expect(summary.windows.lastHour.observedMinutes).toBe(30)
     expect(summary.rates.lastHourTokensPerHour).toBeCloseTo(728) // 364 tokens across 30m -> 728/hr
     expect(summary.rates.lastFiveHoursTokensPerHour).toBeCloseTo(728)
+  })
+
+  it('flags local logs as stale when no fresh events are present', async () => {
+    const { codexHome, dataDir } = await createFixture([
+      tokenLine(
+        '2026-05-25T09:00:00.000Z',
+        120,
+        30,
+        20,
+        10,
+        180,
+        40,
+        80,
+      ),
+    ])
+
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T13:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.freshness.stale).toBe(true)
+    expect(summary.freshness.staleMinutes).toBe(270)
+    expect(summary.alerts.some((alert) => alert.id === 'local-stale-critical')).toBe(true)
   })
 })
 
@@ -356,11 +499,11 @@ function tokenLine(
 }
 
 type BucketShape = {
-  input_tokens: number
-  cached_input_tokens: number
-  output_tokens: number
-  reasoning_output_tokens: number
-  total_tokens: number
+  input_tokens: number | string
+  cached_input_tokens: number | string
+  output_tokens: number | string
+  reasoning_output_tokens: number | string
+  total_tokens?: number | string
 }
 
 function bucket(
