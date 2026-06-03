@@ -1,4 +1,4 @@
-import { createReadStream } from 'node:fs'
+﻿import { createReadStream } from 'node:fs'
 import {
   access,
   appendFile,
@@ -14,9 +14,33 @@ import path from 'node:path'
 const HISTORY_FILE = 'history.jsonl'
 const CACHE_TTL_MS = 5_000
 const HISTORY_KEEP_DAYS = 14
-const ABSOLUTE_SPIKE_RATE_PER_MINUTE = 250_000
-const ADAPTIVE_SPIKE_MULTIPLIER = 6
-const SPIKE_RATE_REFERENCE_WINDOW = 6
+const DEFAULT_ANOMALY_POLICY = 'normal'
+
+type AnomalyPolicy = 'strict' | 'normal' | 'relaxed'
+
+type AnomalyPolicyConfig = {
+  absoluteRatePerMinute: number
+  adaptiveMultiplier: number
+  referenceWindow: number
+}
+
+const ANOMALY_POLICY: Record<AnomalyPolicy, AnomalyPolicyConfig> = {
+  strict: {
+    absoluteRatePerMinute: 120_000,
+    adaptiveMultiplier: 4.5,
+    referenceWindow: 6,
+  },
+  normal: {
+    absoluteRatePerMinute: 250_000,
+    adaptiveMultiplier: 6,
+    referenceWindow: 6,
+  },
+  relaxed: {
+    absoluteRatePerMinute: 500_000,
+    adaptiveMultiplier: 8,
+    referenceWindow: 7,
+  },
+}
 
 type SourceKind = 'sessions' | 'archived_sessions'
 
@@ -217,6 +241,7 @@ export type UsageOptions = {
   now?: number
   writeHistory?: boolean
   useCache?: boolean
+  anomalyPolicy?: string
 }
 
 let cache: { key: string; expiresAt: number; value: UsageSummary } | null = null
@@ -232,7 +257,8 @@ export async function getUsageSummary(
   const now = options.now ?? Date.now()
   const codexHome = resolveCodexHome(options.codexHome)
   const dataDir = resolveDataDir(options.dataDir)
-  const cacheKey = `${codexHome}|${dataDir}|${options.writeHistory ?? true}`
+  const anomalyPolicy = resolveAnomalyPolicy(options.anomalyPolicy)
+  const cacheKey = `${codexHome}|${dataDir}|${options.writeHistory ?? true}|${anomalyPolicy}`
 
   if (options.useCache !== false && cache && cache.key === cacheKey && cache.expiresAt > now) {
     return cache.value
@@ -271,6 +297,7 @@ export async function getUsageSummary(
     now,
     [],
     parseDiagnostics,
+    anomalyPolicy,
   )
   const history = options.writeHistory === false
     ? await readHistory(dataDir, now)
@@ -494,9 +521,10 @@ function buildSummary(
   now: number,
   samples: HistoryPoint[],
   parseDiagnostics: ParseDiagnostics,
+  anomalyPolicy: AnomalyPolicy,
 ): UsageSummary {
   const latest = events.at(-1)
-  const usageBuild = buildUsageEvents(events)
+  const usageBuild = buildUsageEvents(events, { anomalyPolicy })
   const usageEvents = usageBuild.events
   const sessionIds = new Set(events.map((event) => event.sessionId))
   const lastHourEvents = eventsSince(usageEvents, now - 60 * 60 * 1000)
@@ -614,18 +642,24 @@ function buildSummary(
           ? `${parseDiagnostics.malformedLines} malformed lines were skipped while parsing logs.`
           : 'Parser accepted all discovered token_count lines.',
         `Observed deltas were filtered for counter resets (${parseDiagnostics.resetEvents}) and likely anomalies (${parseDiagnostics.anomalousDeltas}).`,
+        `Anomaly policy is set to '${anomalyPolicy}' when classifying suspect token deltas.`,
       ],
     },
   }
 }
 
-function buildUsageEvents(events: TokenEvent[]): {
+function buildUsageEvents(
+  events: TokenEvent[],
+  options: { anomalyPolicy?: AnomalyPolicy } = {},
+): {
   events: UsageEvent[]
   resetEvents: number
   anomalousDeltas: number
   ignoredEvents: number
   usageMethodDescription: string
 } {
+  const policy = resolveAnomalyPolicy(options.anomalyPolicy)
+  const policyConfig = ANOMALY_POLICY[policy]
   const bySession = new Map<string, TokenEvent[]>()
 
   events.forEach((event) => {
@@ -664,7 +698,7 @@ function buildUsageEvents(events: TokenEvent[]): {
       const isAdaptiveSpike =
         recentRatesPerMinute.length >= 3 &&
         meanRate > 0 &&
-        ratePerMinute > meanRate * ADAPTIVE_SPIKE_MULTIPLIER
+        ratePerMinute > meanRate * policyConfig.adaptiveMultiplier
       const droppedCounter =
         hasSeenFirst && Number.isFinite(previous.totalTokens)
           ? current.totalTokens < previous.totalTokens
@@ -672,7 +706,7 @@ function buildUsageEvents(events: TokenEvent[]): {
       const isHugeSpike =
         hasSeenFirst &&
         delta.totalTokens > 0 &&
-        (ratePerMinute > ABSOLUTE_SPIKE_RATE_PER_MINUTE || isAdaptiveSpike)
+        (ratePerMinute > policyConfig.absoluteRatePerMinute || isAdaptiveSpike)
       const shouldIgnore = droppedCounter || isHugeSpike
 
       if (!hasSeenFirst) {
@@ -694,7 +728,7 @@ function buildUsageEvents(events: TokenEvent[]): {
           usageEvents.push({ ...event, delta })
           if (ratePerMinute > 0 && Number.isFinite(ratePerMinute)) {
             recentRatesPerMinute.push(ratePerMinute)
-            if (recentRatesPerMinute.length > SPIKE_RATE_REFERENCE_WINDOW) {
+            if (recentRatesPerMinute.length > policyConfig.referenceWindow) {
               recentRatesPerMinute.shift()
             }
           }
@@ -717,6 +751,13 @@ function buildUsageEvents(events: TokenEvent[]): {
     usageMethodDescription:
       'Per-session cumulative deltas with reset and anomalous-delta protections.',
   }
+}
+
+function resolveAnomalyPolicy(candidate?: string): AnomalyPolicy {
+  if (candidate === 'strict' || candidate === 'normal' || candidate === 'relaxed') {
+    return candidate
+  }
+  return DEFAULT_ANOMALY_POLICY
 }
 function buildAlerts(
   summary: UsageSummary,
@@ -1497,3 +1538,5 @@ function formatCompact(value: number): string {
   }
   return `${Math.round(value)}`
 }
+
+

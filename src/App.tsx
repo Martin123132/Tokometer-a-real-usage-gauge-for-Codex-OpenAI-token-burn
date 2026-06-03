@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import './App.css'
+
+type AnomalyPolicy = 'strict' | 'normal' | 'relaxed'
 
 type TokenTotals = {
   inputTokens: number
@@ -160,6 +162,7 @@ type AppSettings = {
   dangerThreshold: number
   mismatchThreshold: number
   activeBurnScale: number
+  anomalyPolicy: AnomalyPolicy
 }
 
 const defaultSettings: AppSettings = {
@@ -167,7 +170,14 @@ const defaultSettings: AppSettings = {
   dangerThreshold: 82,
   mismatchThreshold: 8,
   activeBurnScale: 240_000,
+  anomalyPolicy: 'normal',
 }
+
+const anomalyPolicyChoices: { value: AnomalyPolicy; label: string }[] = [
+  { value: 'strict', label: 'Strict (filter more spikes)' },
+  { value: 'normal', label: 'Normal (balanced)' },
+  { value: 'relaxed', label: 'Relaxed (keep large surges)' },
+]
 
 const settingsStorageKey = 'tokometer-settings-v1'
 const primaryMeterStorageKey = 'tokometer-primary-meter'
@@ -196,12 +206,14 @@ function App() {
     )
   })
 
-  const refresh = async () => {
+  const refresh = useCallback(async () => {
     setLoading(true)
     setError(null)
 
     try {
-      const response = await fetch('/api/usage')
+      const query = new URLSearchParams()
+      query.set('anomalyPolicy', settings.anomalyPolicy)
+      const response = await fetch(`/api/usage?${query.toString()}`)
       if (!response.ok) {
         throw new Error(`Usage API returned ${response.status}`)
       }
@@ -216,7 +228,7 @@ function App() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [settings.anomalyPolicy])
 
   useEffect(() => {
     const firstRun = window.setTimeout(() => void refresh(), 0)
@@ -228,7 +240,7 @@ function App() {
       window.clearTimeout(firstRun)
       window.clearInterval(timer)
     }
-  }, [settings.refreshSeconds])
+  }, [settings.refreshSeconds, settings.anomalyPolicy, refresh])
 
   useEffect(() => {
     window.localStorage.setItem(settingsStorageKey, JSON.stringify(settings))
@@ -256,9 +268,19 @@ function App() {
   const parseDiagnostics = data?.source.parseDiagnostics
   const parseWarningRate =
     (parseDiagnostics?.malformedLines ?? 0) + (parseDiagnostics?.parseFailures ?? 0)
+  const staleRefreshWindowMinutes = Math.max(5, (settings.refreshSeconds * 3) / 60)
+  const staleByRefreshWindow =
+    staleAgeMinutes !== null && staleAgeMinutes > staleRefreshWindowMinutes
+  const hasSampleWarning =
+    (data?.freshness.stale ?? false) || staleByRefreshWindow || hasLowConfidenceProjection
 
   const qualityNotes = useMemo(() => {
     const items: string[] = []
+    if (staleAgeMinutes !== null && staleByRefreshWindow) {
+      items.push(
+        `No fresh token events in the last ${Math.round(staleAgeMinutes)}m (refresh window ~${Math.round(staleRefreshWindowMinutes)}m).`,
+      )
+    }
     if (staleAgeMinutes !== null && staleAgeMinutes > 180) {
       items.push(`Local token log is stale (${Math.round(staleAgeMinutes)} min since last event).`)
     }
@@ -272,7 +294,15 @@ function App() {
       items.push(`Projection confidence: ${projectionConfidence.level} - ${projectionConfidence.reason}`)
     }
     return items
-  }, [staleAgeMinutes, parseWarningRate, parseDiagnostics, hasLowConfidenceProjection, projectionConfidence])
+  }, [
+    staleAgeMinutes,
+    staleByRefreshWindow,
+    staleRefreshWindowMinutes,
+    parseWarningRate,
+    parseDiagnostics,
+    hasLowConfidenceProjection,
+    projectionConfidence,
+  ])
 
   const setPrimaryMeterValue = (nextValue: string) => {
     setPrimaryMeterOverride(nextValue)
@@ -344,9 +374,9 @@ function App() {
         <header className="topbar">
           <div>
             <h1>Tokometer</h1>
-            <div className="meta-row">
+        <div className="meta-row">
               <StatusPill tone="known" label="Known Metadata" />
-              {hasLowConfidenceProjection || (data?.freshness.stale ?? false) ? (
+              {hasSampleWarning ? (
                 <StatusPill tone="warning" label="Sample Warning" />
               ) : null}
               <span>Token Gauge</span>
@@ -588,6 +618,13 @@ function SettingsView({
           <span>Local preferences</span>
         </div>
         <div className="settings-controls">
+          <SettingSelectField
+            id="anomaly-policy"
+            label="Anomaly policy"
+            value={settings.anomalyPolicy}
+            options={anomalyPolicyChoices}
+            onChange={(value) => updateSetting({ anomalyPolicy: value })}
+          />
           <SettingNumberField
             id="refresh-seconds"
             label="Refresh"
@@ -729,6 +766,48 @@ function SettingNumberField({
           }}
         />
         <em>{suffix}</em>
+      </div>
+    </label>
+  )
+}
+
+function SettingSelectField({
+  id,
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  id: string
+  label: string
+  value: AnomalyPolicy
+  options: { value: AnomalyPolicy; label: string }[]
+  onChange: (value: AnomalyPolicy) => void
+}) {
+  return (
+    <label className="settings-field" htmlFor={id}>
+      <span>{label}</span>
+      <div>
+        <select
+          id={id}
+          value={value}
+          onChange={(event) => {
+            const nextValue = event.currentTarget.value
+            if (
+              nextValue === 'strict' ||
+              nextValue === 'normal' ||
+              nextValue === 'relaxed'
+            ) {
+              onChange(nextValue)
+            }
+          }}
+        >
+          {options.map((option) => (
+            <option value={option.value} key={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
       </div>
     </label>
   )
@@ -1504,6 +1583,12 @@ function loadSettings(): AppSettings {
         10_000_000,
         defaultSettings.activeBurnScale,
       ),
+      anomalyPolicy:
+        parsed.anomalyPolicy === 'strict' ||
+        parsed.anomalyPolicy === 'normal' ||
+        parsed.anomalyPolicy === 'relaxed'
+          ? parsed.anomalyPolicy
+          : defaultSettings.anomalyPolicy,
     }
   } catch {
     return defaultSettings

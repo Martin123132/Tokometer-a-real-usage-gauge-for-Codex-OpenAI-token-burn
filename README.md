@@ -90,6 +90,7 @@ The Settings view stores local UI preferences in browser/Electron local storage:
 - Visible-vs-local mismatch threshold
 - Burn-rate full-scale value
 - 5h and weekly app meter overrides
+- Parser anomaly policy (`strict`, `normal`, `relaxed`)
 
 Runtime paths are still process-level settings. Set `TOKEN_GAUGE_CODEX_HOME` or `TOKEN_GAUGE_DATA_DIR` before starting Tokometer when you need to scan or store data somewhere else.
 
@@ -168,6 +169,12 @@ The Vite dev server exposes:
 ```text
 /api/health
 /api/usage
+```
+
+`/api/usage` also accepts `anomalyPolicy` as a query parameter:
+
+```text
+/api/usage?anomalyPolicy=relaxed
 ```
 
 ## Privacy

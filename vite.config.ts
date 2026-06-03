@@ -15,9 +15,13 @@ export default defineConfig({
           response.end(JSON.stringify({ ok: true }))
         })
 
-        server.middlewares.use('/api/usage', async (_request, response) => {
+        server.middlewares.use('/api/usage', async (request, response) => {
+          const anomalyPolicy = request.url
+            ? new URL(request.url, 'http://localhost').searchParams.get('anomalyPolicy') ??
+              undefined
+            : undefined
           try {
-            const payload = await getUsageSummary()
+            const payload = await getUsageSummary({ anomalyPolicy })
             response.statusCode = 200
             response.setHeader('Content-Type', 'application/json')
             response.end(JSON.stringify(payload))

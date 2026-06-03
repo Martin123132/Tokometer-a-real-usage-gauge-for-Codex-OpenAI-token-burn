@@ -270,6 +270,112 @@ describe('usage parser', () => {
     expect(summary.windows.lastHour.totalTokens).toBe(48)
   })
 
+  it('supports configurable anomaly policy strictness', async () => {
+    const lines = [
+      tokenLineWithBuckets(
+        '2026-05-25T10:00:00.000Z',
+        {
+          total: bucket(1_000, 200, 50, 10, 1_260),
+          last: bucket(1_000, 200, 50, 10, 1_260),
+        },
+        30,
+        47,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:01:00.000Z',
+        {
+          total: bucket(301_000, 200, 50, 10, 301_260),
+          last: bucket(301_000, 200, 50, 10, 301_260),
+        },
+        32,
+        48,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:02:00.000Z',
+        {
+          total: bucket(301_250, 200, 70, 10, 301_320),
+          last: bucket(301_250, 200, 70, 10, 301_320),
+        },
+        33,
+        48,
+      ),
+    ]
+    const { codexHome, dataDir } = await createFixture(lines)
+
+    const strict = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:10:00.000Z'),
+      anomalyPolicy: 'strict',
+      writeHistory: false,
+      useCache: false,
+    })
+    const relaxed = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:10:00.000Z'),
+      anomalyPolicy: 'relaxed',
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(strict.source.parseDiagnostics.anomalousDeltas).toBe(1)
+    expect(relaxed.source.parseDiagnostics.anomalousDeltas).toBe(0)
+    expect(strict.source.eventsFound).toBe(1)
+    expect(relaxed.source.eventsFound).toBe(2)
+    expect(relaxed.source.ignoredEvents).toBe(0)
+    expect(strict.source.ignoredEvents).toBe(1)
+    expect(relaxed.windows.lastHour.totalTokens).toBeGreaterThan(
+      strict.windows.lastHour.totalTokens,
+    )
+  })
+
+  it('falls back to normal anomaly policy for invalid values', async () => {
+    const lines = [
+      tokenLineWithBuckets(
+        '2026-05-25T10:00:00.000Z',
+        {
+          total: bucket(1_000, 200, 50, 10, 1_260),
+          last: bucket(1_000, 200, 50, 10, 1_260),
+        },
+        30,
+        47,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:01:00.000Z',
+        {
+          total: bucket(301_000, 200, 50, 10, 301_260),
+          last: bucket(301_000, 200, 50, 10, 301_260),
+        },
+        32,
+        48,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:02:00.000Z',
+        {
+          total: bucket(301_250, 200, 70, 10, 301_320),
+          last: bucket(301_250, 200, 70, 10, 301_320),
+        },
+        33,
+        48,
+      ),
+    ]
+    const { codexHome, dataDir } = await createFixture(lines)
+
+    const fallback = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:10:00.000Z'),
+      anomalyPolicy: 'invalid-policy',
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(fallback.source.parseDiagnostics.anomalousDeltas).toBe(1)
+    expect(fallback.source.eventsFound).toBe(1)
+    expect(fallback.source.ignoredEvents).toBe(1)
+  })
+
   it('uses observed elapsed minutes for sparse 5h/last-hour rates', async () => {
     const lines = [
       tokenLineWithBuckets(

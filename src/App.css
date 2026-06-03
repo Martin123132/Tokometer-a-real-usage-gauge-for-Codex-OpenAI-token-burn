@@ -506,7 +506,23 @@ button:hover {
   font: 800 16px/1 var(--mono);
 }
 
+.settings-field select {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid rgba(55, 214, 255, 0.26);
+  border-radius: 8px;
+  padding: 0 10px;
+  color: #f4f8fb;
+  background: rgba(8, 12, 16, 0.62);
+  font: 800 14px/1 var(--mono);
+}
+
 .settings-field input:focus {
+  border-color: rgba(55, 214, 255, 0.72);
+  outline: 2px solid rgba(55, 214, 255, 0.16);
+}
+
+.settings-field select:focus {
   border-color: rgba(55, 214, 255, 0.72);
   outline: 2px solid rgba(55, 214, 255, 0.16);
 }

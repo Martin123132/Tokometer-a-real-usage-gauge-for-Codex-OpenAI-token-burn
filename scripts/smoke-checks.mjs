@@ -68,7 +68,7 @@ function printSummary(name, pass, detail) {
   console.log(`${pass ? '[PASS]' : '[FAIL]'} ${name}: ${detail}`)
 }
 
-async function runScenario(name, lines, nowIso, validator) {
+async function runScenario(name, lines, nowIso, validator, options = {}) {
   const { codexHome, dataDir, cleanup } = await createFixture(lines)
   try {
     const summary = await getUsageSummary({
@@ -77,6 +77,7 @@ async function runScenario(name, lines, nowIso, validator) {
       now: Date.parse(nowIso),
       writeHistory: false,
       useCache: false,
+      ...options,
     })
 
     validator(summary)
@@ -111,6 +112,87 @@ async function run() {
         'expected local-stale-critical alert',
       )
     },
+  )
+
+  await runScenario(
+    'policy variance in burst handling',
+    [
+      tokenLine(
+        '2026-05-25T10:00:00.000Z',
+        {
+          total: bucket(1_000, 200, 50, 10, 1_260),
+          last: bucket(1_000, 200, 50, 10, 1_260),
+        },
+        30,
+        47,
+      ),
+      tokenLine(
+        '2026-05-25T10:01:00.000Z',
+        {
+          total: bucket(301_000, 200, 50, 10, 301_260),
+          last: bucket(301_000, 200, 50, 10, 301_260),
+        },
+        32,
+        48,
+      ),
+      tokenLine(
+        '2026-05-25T10:02:00.000Z',
+        {
+          total: bucket(301_250, 200, 70, 10, 301_320),
+          last: bucket(301_250, 200, 70, 10, 301_320),
+        },
+        33,
+        48,
+      ),
+    ],
+    '2026-05-25T10:10:00.000Z',
+    (summary) => {
+      assert(summary.source.parseDiagnostics.anomalousDeltas >= 1, 'expected strict-like anomaly suppression by default policy')
+      assert(summary.source.ignoredEvents >= 1, 'expected at least one ignored burst sample')
+      assert(summary.windows.lastHour.totalTokens > 0, 'expected observed post-burst delta')
+    },
+    { anomalyPolicy: 'normal' },
+  )
+
+  await runScenario(
+    'policy relaxed keeps burst sample',
+    [
+      tokenLine(
+        '2026-05-25T10:00:00.000Z',
+        {
+          total: bucket(1_000, 200, 50, 10, 1_260),
+          last: bucket(1_000, 200, 50, 10, 1_260),
+        },
+        30,
+        47,
+      ),
+      tokenLine(
+        '2026-05-25T10:01:00.000Z',
+        {
+          total: bucket(301_000, 200, 50, 10, 301_260),
+          last: bucket(301_000, 200, 50, 10, 301_260),
+        },
+        32,
+        48,
+      ),
+      tokenLine(
+        '2026-05-25T10:02:00.000Z',
+        {
+          total: bucket(301_250, 200, 70, 10, 301_320),
+          last: bucket(301_250, 200, 70, 10, 301_320),
+        },
+        33,
+        48,
+      ),
+    ],
+    '2026-05-25T10:10:00.000Z',
+    (summary) => {
+      assert(summary.source.parseDiagnostics.anomalousDeltas === 0, 'expected relaxed policy to keep burst sample')
+      assert(summary.source.parseDiagnostics.resetEvents === 0, 'expected no reset classification in relaxed mode')
+      assert(summary.source.ignoredEvents === 0, 'expected full burst visibility with relaxed policy')
+      assert(summary.windows.lastHour.totalTokens > 150_000, 'expected large retained burst delta')
+    },
+    { anomalyPolicy: 'relaxed' },
   )
 
   await runScenario(

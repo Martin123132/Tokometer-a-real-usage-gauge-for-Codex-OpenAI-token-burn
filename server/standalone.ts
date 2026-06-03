@@ -29,8 +29,9 @@ const server = createServer(async (request, response) => {
   }
 
   if (url.pathname === '/api/usage') {
+    const anomalyPolicy = url.searchParams.get('anomalyPolicy') ?? undefined
     try {
-      sendJson(response, await getUsageSummary())
+      sendJson(response, await getUsageSummary({ anomalyPolicy }))
     } catch (error) {
       response.statusCode = 500
       sendJson(response, {
