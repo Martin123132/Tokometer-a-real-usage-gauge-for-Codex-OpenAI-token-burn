@@ -3,6 +3,13 @@ import './App.css'
 
 type AnomalyPolicy = 'strict' | 'normal' | 'relaxed'
 
+type AnomalyPolicyRecommendation = {
+  policy: AnomalyPolicy
+  reason: string
+  ignoredRatio: number
+  parseIssueRatio: number
+}
+
 type TokenTotals = {
   inputTokens: number
   cachedInputTokens: number
@@ -111,8 +118,11 @@ type UsageData = {
   rates: {
     lastHourTokensPerHour: number
     lastHourActiveTokensPerHour: number
+    lastHourRateConfidence: DataConfidence
     lastFiveHoursTokensPerHour: number
+    lastFiveHoursRateConfidence: DataConfidence
     lastDayTokensPerHour: number
+    lastDayRateConfidence: DataConfidence
     weeklyPercent: {
       percentPerHour: number | null
       projectedExhaustAt: string | null
@@ -273,6 +283,10 @@ function App() {
     staleAgeMinutes !== null && staleAgeMinutes > staleRefreshWindowMinutes
   const hasSampleWarning =
     (data?.freshness.stale ?? false) || staleByRefreshWindow || hasLowConfidenceProjection
+  const anomalyPolicyRecommendation = useMemo(
+    () => recommendAnomalyPolicy(data),
+    [data],
+  )
 
   const qualityNotes = useMemo(() => {
     const items: string[] = []
@@ -413,10 +427,14 @@ function App() {
         {error ? <div className="inline-error">{error}</div> : null}
 
         {viewMode === 'settings' ? (
-          <SettingsView
+      <SettingsView
             data={data}
             settings={settings}
             onSettingsChange={setSettings}
+            anomalyPolicyRecommendation={anomalyPolicyRecommendation}
+            onApplyRecommendedPolicy={(policy) =>
+              setSettings((previous) => ({ ...previous, anomalyPolicy: policy }))
+            }
             primaryMeterOverride={primaryMeterOverride}
             weeklyMeterOverride={meterOverride}
             onPrimaryMeterChange={setPrimaryMeterValue}
@@ -583,6 +601,8 @@ function SettingsView({
   data,
   settings,
   onSettingsChange,
+  anomalyPolicyRecommendation,
+  onApplyRecommendedPolicy,
   primaryMeterOverride,
   weeklyMeterOverride,
   onPrimaryMeterChange,
@@ -593,6 +613,8 @@ function SettingsView({
   data: UsageData | null
   settings: AppSettings
   onSettingsChange: (settings: AppSettings) => void
+  anomalyPolicyRecommendation: AnomalyPolicyRecommendation | null
+  onApplyRecommendedPolicy: (policy: AnomalyPolicy) => void
   primaryMeterOverride: string
   weeklyMeterOverride: string
   onPrimaryMeterChange: (value: string) => void
@@ -624,6 +646,11 @@ function SettingsView({
             value={settings.anomalyPolicy}
             options={anomalyPolicyChoices}
             onChange={(value) => updateSetting({ anomalyPolicy: value })}
+          />
+          <SettingCalibrationField
+            recommendation={anomalyPolicyRecommendation}
+            currentPolicy={settings.anomalyPolicy}
+            onApply={(nextPolicy) => onApplyRecommendedPolicy(nextPolicy)}
           />
           <SettingNumberField
             id="refresh-seconds"
@@ -728,6 +755,50 @@ function SettingsView({
         </div>
       </section>
     </section>
+  )
+}
+
+function SettingCalibrationField({
+  recommendation,
+  currentPolicy,
+  onApply,
+}: {
+  recommendation: AnomalyPolicyRecommendation | null
+  currentPolicy: AnomalyPolicy
+  onApply: (policy: AnomalyPolicy) => void
+}) {
+  if (!recommendation) {
+    return null
+  }
+
+  const suggestionPolicy = recommendation.policy
+  const actionLabel =
+    currentPolicy === suggestionPolicy
+      ? 'Already active'
+      : `Apply ${policyLabel(suggestionPolicy)}`
+
+  return (
+    <div className="settings-field">
+      <span>Policy calibration</span>
+      <div className="calibration-control">
+        <div>
+          <strong>{policyLabel(suggestionPolicy)} recommended</strong>
+          <p>
+            {recommendation.reason}
+            {` (${Math.round(recommendation.ignoredRatio * 100)}% ignored, ${Math.round(
+              recommendation.parseIssueRatio * 100,
+            )}% parse issues)`}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => onApply(suggestionPolicy)}
+          disabled={currentPolicy === suggestionPolicy}
+        >
+          {actionLabel}
+        </button>
+      </div>
+    </div>
   )
 }
 
@@ -1526,6 +1597,70 @@ function formatProjection(data: UsageData | null) {
   return projection.projectedExhaustAt
     ? `${formatDate(projection.projectedExhaustAt)} (${projection.confidence.level} confidence)`
     : `${projection.percentPerHour.toFixed(2)}%/hr (${projection.confidence.level} confidence)`
+}
+
+function policyLabel(policy: AnomalyPolicy): string {
+  return policy === 'strict'
+    ? 'Strict'
+    : policy === 'relaxed'
+      ? 'Relaxed'
+      : 'Normal'
+}
+
+function recommendAnomalyPolicy(
+  data: UsageData | null,
+): AnomalyPolicyRecommendation | null {
+  if (!data) {
+    return null
+  }
+
+  const diagnostics = data.source.parseDiagnostics
+  const sampleCount = data.source.ignoredEvents + data.source.eventsFound
+  const parsedLines = Math.max(1, diagnostics.parsedLines)
+  const parseIssueRatio = Math.min(
+    1,
+    (diagnostics.malformedLines + diagnostics.parseFailures) / parsedLines,
+  )
+  const ignoredRatio = Math.min(
+    1,
+    diagnostics.ignoredEvents / Math.max(1, sampleCount),
+  )
+
+  if (sampleCount < 5 || diagnostics.parsedLines === 0) {
+    return null
+  }
+
+  if (ignoredRatio >= 0.35 || parseIssueRatio >= 0.25) {
+    return {
+      policy: 'strict',
+      reason: 'Recent samples contain noisy drops or malformed data, so filtering should be stricter.',
+      ignoredRatio,
+      parseIssueRatio,
+    }
+  }
+
+  if (
+    ignoredRatio <= 0.08 &&
+    parseIssueRatio <= 0.04 &&
+    data.source.ignoredEvents === 0 &&
+    data.rates.lastHourRateConfidence?.level === 'high'
+  ) {
+    return {
+      policy: 'relaxed',
+      reason:
+        'Your stream is clean and stable with high local burn confidence, so strict filtering may be unnecessary.',
+      ignoredRatio,
+      parseIssueRatio,
+    }
+  }
+
+  return {
+    policy: 'normal',
+    reason:
+      'Current signal quality is mostly steady; the balanced anomaly policy is a good middle ground.',
+    ignoredRatio,
+    parseIssueRatio,
+  }
 }
 
 function shortSession(sessionId: string) {

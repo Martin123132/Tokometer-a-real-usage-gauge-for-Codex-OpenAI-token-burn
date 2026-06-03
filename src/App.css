@@ -477,6 +477,28 @@ button:hover {
   gap: 9px;
 }
 
+.calibration-control {
+  display: grid;
+  gap: 10px;
+  align-items: start;
+}
+
+.calibration-control div {
+  display: grid;
+  gap: 6px;
+}
+
+.calibration-control p {
+  margin: 0;
+  color: #a8b8c6;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.calibration-control button {
+  justify-self: start;
+}
+
 .settings-field span,
 .path-line span,
 .command-line span,
