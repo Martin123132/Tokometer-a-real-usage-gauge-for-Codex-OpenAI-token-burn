@@ -14,6 +14,9 @@ import path from 'node:path'
 const HISTORY_FILE = 'history.jsonl'
 const CACHE_TTL_MS = 5_000
 const HISTORY_KEEP_DAYS = 14
+const ABSOLUTE_SPIKE_RATE_PER_MINUTE = 250_000
+const ADAPTIVE_SPIKE_MULTIPLIER = 6
+const SPIKE_RATE_REFERENCE_WINDOW = 6
 
 type SourceKind = 'sessions' | 'archived_sessions'
 
@@ -641,6 +644,7 @@ function buildUsageEvents(events: TokenEvent[]): {
     let previous = emptyTotals()
     let previousTimestampMs = NaN
     let hasSeenFirst = false
+    const recentRatesPerMinute: number[] = []
 
     sessionEvents.forEach((event) => {
       const current = toTotals(event.totals)
@@ -650,6 +654,17 @@ function buildUsageEvents(events: TokenEvent[]): {
           : 0
 
       const delta = subtractPositive(current, previous)
+      const ratePerMinute =
+        hasSeenFirst && elapsedMinutes > 0 ? delta.totalTokens / elapsedMinutes : 0
+      const meanRate =
+        recentRatesPerMinute.length > 0
+          ? recentRatesPerMinute.reduce((sum, rate) => sum + rate, 0) /
+            recentRatesPerMinute.length
+          : 0
+      const isAdaptiveSpike =
+        recentRatesPerMinute.length >= 3 &&
+        meanRate > 0 &&
+        ratePerMinute > meanRate * ADAPTIVE_SPIKE_MULTIPLIER
       const droppedCounter =
         hasSeenFirst && Number.isFinite(previous.totalTokens)
           ? current.totalTokens < previous.totalTokens
@@ -657,7 +672,7 @@ function buildUsageEvents(events: TokenEvent[]): {
       const isHugeSpike =
         hasSeenFirst &&
         delta.totalTokens > 0 &&
-        delta.totalTokens / elapsedMinutes > 250_000
+        (ratePerMinute > ABSOLUTE_SPIKE_RATE_PER_MINUTE || isAdaptiveSpike)
       const shouldIgnore = droppedCounter || isHugeSpike
 
       if (!hasSeenFirst) {
@@ -677,6 +692,12 @@ function buildUsageEvents(events: TokenEvent[]): {
       } else {
         if (!hasSeenFirst || delta.totalTokens > 0) {
           usageEvents.push({ ...event, delta })
+          if (ratePerMinute > 0 && Number.isFinite(ratePerMinute)) {
+            recentRatesPerMinute.push(ratePerMinute)
+            if (recentRatesPerMinute.length > SPIKE_RATE_REFERENCE_WINDOW) {
+              recentRatesPerMinute.shift()
+            }
+          }
         }
       }
 

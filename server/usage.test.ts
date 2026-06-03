@@ -473,6 +473,74 @@ describe('usage parser', () => {
     expect(summary.windows.lastHour.activeTokens).toBe(860)
     expect(summary.rates.lastHourRateConfidence.level).toBe('medium')
   })
+
+  it('keeps sustained high but stable per-minute rates in analysis', async () => {
+    const baseTotal = 10_000
+    const lines = Array.from({ length: 7 }, (_, index) => {
+      const total = 100 + baseTotal * index
+      return tokenLineWithBuckets(
+        `2026-05-25T10:${String(index).padStart(2, '0')}:00.000Z`,
+        {
+          total: bucket(total, 0, 0, 0, total),
+          last: bucket(total, 0, 0, 0, total),
+        },
+        20 + index,
+        60 + index,
+      )
+    })
+
+    const { codexHome, dataDir } = await createFixture(lines)
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:06:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.source.parseDiagnostics.anomalousDeltas).toBe(0)
+    expect(summary.source.parseDiagnostics.resetEvents).toBe(0)
+    expect(summary.source.ignoredEvents).toBe(0)
+    expect(summary.source.eventsFound).toBe(6)
+  })
+
+  it('flags an adaptive spike relative to recent high-traffic baseline', async () => {
+    const baselineEvents = [
+      { total: 100, minute: 0 },
+      { total: 10_100, minute: 1 },
+      { total: 20_100, minute: 2 },
+      { total: 30_100, minute: 3 },
+      { total: 40_100, minute: 4 },
+      { total: 140_100, minute: 5 },
+      { total: 150_100, minute: 6 },
+    ]
+
+    const lines = baselineEvents.map(({ total, minute }) =>
+      tokenLineWithBuckets(
+        `2026-05-25T10:${String(minute).padStart(2, '0')}:00.000Z`,
+        {
+          total: bucket(total, 0, 0, 0, total),
+          last: bucket(total, 0, 0, 0, total),
+        },
+        24 + (minute % 10),
+        62 + (minute % 8),
+      ),
+    )
+
+    const { codexHome, dataDir } = await createFixture(lines)
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:06:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.source.parseDiagnostics.anomalousDeltas).toBe(1)
+    expect(summary.source.ignoredEvents).toBe(1)
+    expect(summary.source.eventsFound).toBe(5)
+    expect(summary.windows.lastHour.totalTokens).toBe(50_000)
+  })
 })
 
 describe('projection confidence', () => {
