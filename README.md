@@ -77,6 +77,7 @@ npm run pack      # Build unpacked desktop app into release/
 npm run dist      # Build installable desktop artifacts into release/
 npm run serve     # Serve an existing dist build
 npm run test      # Parser/unit tests
+npm run smoke     # Manual smoke scenarios (requires node / scripts/smoke-checks.mjs)
 npm run lint      # ESLint
 ```
 

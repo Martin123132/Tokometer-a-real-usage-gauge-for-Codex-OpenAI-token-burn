@@ -341,6 +341,138 @@ describe('usage parser', () => {
     expect(summary.freshness.staleMinutes).toBe(270)
     expect(summary.alerts.some((alert) => alert.id === 'local-stale-critical')).toBe(true)
   })
+
+  it('survives rapid burst events without letting one spike dominate burn math', async () => {
+    const lines = [
+      tokenLineWithBuckets(
+        '2026-05-25T10:00:00.000Z',
+        {
+          total: bucket(1_000, 500, 200, 20, 1_720),
+          last: bucket(1_000, 500, 200, 20, 1_720),
+        },
+        35,
+        65,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:00:30.000Z',
+        {
+          total: bucket(1_150_000, 500, 200, 20, 1_150_720),
+          last: bucket(1_150_000, 500, 200, 20, 1_150_720),
+        },
+        36,
+        66,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:01:00.000Z',
+        {
+          total: bucket(1_080, 500, 230, 20, 1_630),
+          last: bucket(1_080, 500, 230, 20, 1_630),
+        },
+        36,
+        66,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:02:00.000Z',
+        {
+          total: bucket(1_200, 520, 240, 22, 1_782),
+          last: bucket(1_200, 520, 240, 22, 1_782),
+        },
+        37,
+        67,
+      ),
+    ]
+
+    const { codexHome, dataDir } = await createFixture(lines)
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:10:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.source.parseDiagnostics.anomalousDeltas).toBe(1)
+    expect(summary.source.parseDiagnostics.resetEvents).toBe(1)
+    expect(summary.source.ignoredEvents).toBe(2)
+    expect(summary.source.eventsFound).toBe(1)
+    expect(summary.rates.lastHourTokensPerHour).toBeLessThan(10_000)
+    expect(summary.rates.lastHourTokensPerHour).toBeGreaterThanOrEqual(0)
+    expect(summary.windows.lastHour.totalTokens).toBe(152)
+  })
+
+  it('handles large cached vs active mix and keeps active burn separate', async () => {
+    const lines = [
+      tokenLineWithBuckets(
+        '2026-05-25T10:00:00.000Z',
+        {
+          total: bucket(10_000, 9_300, 180, 20, 10_200),
+          last: bucket(10_000, 9_300, 180, 20, 10_200),
+        },
+        20,
+        60,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:10:00.000Z',
+        {
+          total: bucket(10_800, 9_940, 190, 22, 11_012),
+          last: bucket(10_800, 9_940, 190, 22, 11_012),
+        },
+        22,
+        61,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:20:00.000Z',
+        {
+          total: bucket(11_600, 10_580, 200, 24, 11_824),
+          last: bucket(11_600, 10_580, 200, 24, 11_824),
+        },
+        24,
+        62,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:30:00.000Z',
+        {
+          total: bucket(12_400, 11_220, 210, 26, 12_636),
+          last: bucket(12_400, 11_220, 210, 26, 12_636),
+        },
+        26,
+        63,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:40:00.000Z',
+        {
+          total: bucket(13_200, 11_860, 220, 28, 13_448),
+          last: bucket(13_200, 11_860, 220, 28, 13_448),
+        },
+        28,
+        64,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:50:00.000Z',
+        {
+          total: bucket(14_000, 12_500, 230, 30, 14_260),
+          last: bucket(14_000, 12_500, 230, 30, 14_260),
+        },
+        30,
+        65,
+      ),
+    ]
+
+    const { codexHome, dataDir } = await createFixture(lines)
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T11:00:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.windows.lastHour.totalTokens).toBe(4_060)
+    expect(summary.windows.lastHour.cachedInputTokens).toBe(3_200)
+    expect(summary.windows.lastHour.uncachedInputTokens).toBe(800)
+    expect(summary.windows.lastHour.activeTokens).toBe(860)
+    expect(summary.rates.lastHourRateConfidence.level).toBe('medium')
+  })
 })
 
 describe('projection confidence', () => {
