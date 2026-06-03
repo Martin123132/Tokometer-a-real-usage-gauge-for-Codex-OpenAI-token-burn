@@ -17,6 +17,37 @@ const HISTORY_KEEP_DAYS = 14
 
 type SourceKind = 'sessions' | 'archived_sessions'
 
+type ConfidenceLevel = 'high' | 'medium' | 'low'
+
+type DataConfidence = {
+  level: ConfidenceLevel
+  score: number
+  reason: string
+}
+
+type ParseFileHealth = {
+  file: string
+  parsedLines: number
+  malformedLines: number
+  parseFailures: number
+  tokenRecords: number
+  usedEvents: number
+  fallbackTokenSourceUsed: number
+}
+
+type ParseDiagnostics = {
+  parsedLines: number
+  malformedLines: number
+  parseFailures: number
+  tokenRecords: number
+  usedEvents: number
+  ignoredEvents: number
+  fallbackTokenSourceUsed: number
+  resetEvents: number
+  anomalousDeltas: number
+  files: ParseFileHealth[]
+}
+
 type TokenBucket = {
   input_tokens?: number
   cached_input_tokens?: number
@@ -38,6 +69,7 @@ type TokenEvent = {
   source: SourceKind
   totals: TokenBucket
   last: TokenBucket
+  totalsSource: 'total' | 'last'
   contextWindow: number | null
   primary: RateWindow | null
   secondary: RateWindow | null
@@ -60,6 +92,9 @@ export type TokenTotals = {
 export type WindowSummary = TokenTotals & {
   activeTokens: number
   eventCount: number
+  observedMinutes: number
+  coveragePercent: number
+  confidence: DataConfidence
 }
 
 type HourBucket = {
@@ -82,6 +117,7 @@ type PercentProjection = {
   percentPerHour: number | null
   projectedExhaustAt: string | null
   basisHours: number | null
+  confidence: DataConfidence
 }
 
 export type GaugeAlert = {
@@ -109,6 +145,9 @@ export type UsageSummary = {
     dataDir: string
     filesScanned: number
     eventsFound: number
+    rawTokenRecords: number
+    ignoredEvents: number
+    parseDiagnostics: ParseDiagnostics
     sessionsFound: number
     generatedAt: string
   }
@@ -141,9 +180,18 @@ export type UsageSummary = {
   rates: {
     lastHourTokensPerHour: number
     lastHourActiveTokensPerHour: number
+    lastHourRateConfidence: DataConfidence
     lastFiveHoursTokensPerHour: number
+    lastFiveHoursRateConfidence: DataConfidence
     lastDayTokensPerHour: number
+    lastDayRateConfidence: DataConfidence
     weeklyPercent: PercentProjection
+  }
+  freshness: {
+    latestEventAt: string | null
+    latestEventAgeMinutes: number | null
+    stale: boolean
+    staleMinutes: number | null
   }
   timeline: HourBucket[]
   topSessions: SessionSummary[]
@@ -169,9 +217,10 @@ export type UsageOptions = {
 }
 
 let cache: { key: string; expiresAt: number; value: UsageSummary } | null = null
+type ParsedTokenEvents = { events: TokenEvent[]; diagnostics: ParseFileHealth }
 const fileCache = new Map<
   string,
-  { mtimeMs: number; size: number; events: TokenEvent[] }
+  { mtimeMs: number; size: number; parsed: ParsedTokenEvents }
 >()
 
 export async function getUsageSummary(
@@ -205,12 +254,21 @@ export async function getUsageSummary(
   const eventGroups = await Promise.all(
     files.map(({ file, source }) => parseTokenEvents(file, source)),
   )
+  const parseDiagnostics = aggregateParseDiagnostics(eventGroups)
   const events = eventGroups
-    .flat()
+    .flatMap((group) => group.events)
     .filter((event) => Number.isFinite(event.timestampMs))
     .sort((a, b) => a.timestampMs - b.timestampMs)
 
-  let summary = buildSummary(codexHome, dataDir, files.length, events, now, [])
+  let summary = buildSummary(
+    codexHome,
+    dataDir,
+    files.length,
+    events,
+    now,
+    [],
+    parseDiagnostics,
+  )
   const history = options.writeHistory === false
     ? await readHistory(dataDir, now)
     : await recordHistory(dataDir, summary, now)
@@ -292,7 +350,7 @@ export async function listJsonlFiles(root: string): Promise<string[]> {
 async function parseTokenEvents(
   filePath: string,
   source: SourceKind,
-): Promise<TokenEvent[]> {
+): Promise<ParsedTokenEvents> {
   const fileStat = await stat(filePath)
   const cached = fileCache.get(filePath)
 
@@ -301,39 +359,70 @@ async function parseTokenEvents(
     cached.mtimeMs === fileStat.mtimeMs &&
     cached.size === fileStat.size
   ) {
-    return cached.events
+    return cached.parsed
   }
 
   const sessionId = path.basename(filePath, '.jsonl').replace(/^rollout-/, '')
   const stream = createReadStream(filePath, { encoding: 'utf8' })
   const reader = createInterface({ input: stream, crlfDelay: Infinity })
+  const diagnostics: ParseFileHealth = {
+    file: filePath,
+    parsedLines: 0,
+    malformedLines: 0,
+    parseFailures: 0,
+    tokenRecords: 0,
+    usedEvents: 0,
+    fallbackTokenSourceUsed: 0,
+  }
   const events: TokenEvent[] = []
 
   for await (const line of reader) {
+    if (!line.trim()) {
+      continue
+    }
+
+    diagnostics.parsedLines += 1
+
     if (!line.includes('"token_count"')) {
+      diagnostics.malformedLines += 1
       continue
     }
 
     try {
       const record = JSON.parse(line)
-      if (
-        record?.type !== 'event_msg' ||
-        record?.payload?.type !== 'token_count'
-      ) {
+      if (record?.type !== 'event_msg' || record?.payload?.type !== 'token_count') {
+        diagnostics.malformedLines += 1
         continue
       }
 
       const info = record.payload.info ?? {}
+      const payloadTotals = parseTotals(info)
+      if (!payloadTotals) {
+        diagnostics.malformedLines += 1
+        continue
+      }
+
+      diagnostics.tokenRecords += 1
+
+      if (payloadTotals.source === 'last') {
+        diagnostics.fallbackTokenSourceUsed += 1
+      }
+
       const rateLimits = record.payload.rate_limits ?? {}
       const timestamp = String(record.timestamp ?? '')
       const timestampMs = Date.parse(timestamp)
+      if (!Number.isFinite(timestampMs)) {
+        diagnostics.malformedLines += 1
+        continue
+      }
 
-      events.push({
+      const parsedEvent: TokenEvent = {
         timestamp,
         timestampMs,
         sessionId,
         source,
-        totals: normalizeBucket(info.total_token_usage),
+        totals: payloadTotals.totals,
+        totalsSource: payloadTotals.source,
         last: normalizeBucket(info.last_token_usage),
         contextWindow:
           typeof info.model_context_window === 'number'
@@ -345,19 +434,53 @@ async function parseTokenEvents(
           typeof rateLimits.plan_type === 'string'
             ? rateLimits.plan_type
             : null,
-      })
+        }
+
+      events.push(parsedEvent)
+      diagnostics.usedEvents += 1
     } catch {
+      diagnostics.parseFailures += 1
       // Session files are append-only logs; a partially written final line is safe to skip.
     }
+  }
+
+  const parsed: ParsedTokenEvents = {
+    events,
+    diagnostics,
   }
 
   fileCache.set(filePath, {
     mtimeMs: fileStat.mtimeMs,
     size: fileStat.size,
-    events,
+    parsed,
   })
 
-  return events
+  return parsed
+}
+
+function aggregateParseDiagnostics(
+  groups: ParsedTokenEvents[],
+): ParseDiagnostics {
+  const files = groups.map((group) => group.diagnostics)
+
+  return {
+    parsedLines: files.reduce((sum, file) => sum + file.parsedLines, 0),
+    malformedLines: files.reduce((sum, file) => sum + file.malformedLines, 0),
+    parseFailures: files.reduce((sum, file) => sum + file.parseFailures, 0),
+    tokenRecords: files.reduce((sum, file) => sum + file.tokenRecords, 0),
+    usedEvents: files.reduce((sum, file) => sum + file.usedEvents, 0),
+    ignoredEvents: files.reduce(
+      (sum, file) => sum + (file.tokenRecords - file.usedEvents),
+      0,
+    ),
+    fallbackTokenSourceUsed: files.reduce(
+      (sum, file) => sum + file.fallbackTokenSourceUsed,
+      0,
+    ),
+    resetEvents: 0,
+    anomalousDeltas: 0,
+    files,
+  }
 }
 
 function buildSummary(
@@ -367,9 +490,11 @@ function buildSummary(
   events: TokenEvent[],
   now: number,
   samples: HistoryPoint[],
+  parseDiagnostics: ParseDiagnostics,
 ): UsageSummary {
   const latest = events.at(-1)
-  const usageEvents = buildUsageEvents(events)
+  const usageBuild = buildUsageEvents(events)
+  const usageEvents = usageBuild.events
   const sessionIds = new Set(events.map((event) => event.sessionId))
   const lastHourEvents = eventsSince(usageEvents, now - 60 * 60 * 1000)
   const lastFiveHourEvents = eventsSince(
@@ -377,10 +502,27 @@ function buildSummary(
     now - 5 * 60 * 60 * 1000,
   )
   const lastDayEvents = eventsSince(usageEvents, now - 24 * 60 * 60 * 1000)
-  const lastHour = summarizeEvents(lastHourEvents)
-  const lastFiveHours = summarizeEvents(lastFiveHourEvents)
-  const lastDay = summarizeEvents(lastDayEvents)
-  const observedAll = summarizeEvents(usageEvents)
+  const lastHour = summarizeWindow(lastHourEvents, now - 60 * 60 * 1000, now)
+  const lastFiveHours = summarizeWindow(
+    lastFiveHourEvents,
+    now - 5 * 60 * 60 * 1000,
+    now,
+  )
+  const lastDay = summarizeWindow(lastDayEvents, now - 24 * 60 * 60 * 1000, now)
+  const observedAll = summarizeWindow(
+    usageEvents,
+    usageEvents.at(0)?.timestampMs ?? now,
+    now,
+  )
+  const lastHourRate = perWindowRates(lastHour)
+  const lastFiveHoursRate = perWindowRates(lastFiveHours)
+  const lastDayRate = perWindowRates(lastDay)
+
+  const latestEventAgeMinutes =
+    latest?.timestampMs !== undefined
+      ? Math.max(0, (now - latest.timestampMs) / 60000)
+      : null
+  const hourlyRateProjection = projectPercent(events, now)
 
   return {
     source: {
@@ -388,7 +530,15 @@ function buildSummary(
       dataDir,
       filesScanned,
       eventsFound: usageEvents.length,
+      rawTokenRecords: parseDiagnostics.tokenRecords,
+      ignoredEvents:
+        parseDiagnostics.ignoredEvents + usageBuild.ignoredEvents,
       sessionsFound: sessionIds.size,
+      parseDiagnostics: {
+        ...parseDiagnostics,
+        resetEvents: parseDiagnostics.resetEvents + usageBuild.resetEvents,
+        anomalousDeltas: parseDiagnostics.anomalousDeltas + usageBuild.anomalousDeltas,
+      },
       generatedAt: new Date(now).toISOString(),
     },
     latest: {
@@ -410,11 +560,26 @@ function buildSummary(
       observedAll,
     },
     rates: {
-      lastHourTokensPerHour: lastHour.totalTokens,
-      lastHourActiveTokensPerHour: lastHour.activeTokens,
-      lastFiveHoursTokensPerHour: lastFiveHours.totalTokens / 5,
-      lastDayTokensPerHour: lastDay.totalTokens / 24,
-      weeklyPercent: projectPercent(events, now),
+      lastHourTokensPerHour: lastHourRate.totalTokensPerHour,
+      lastHourActiveTokensPerHour: lastHourRate.activeTokensPerHour,
+      lastHourRateConfidence: lastHour.confidence,
+      lastFiveHoursTokensPerHour: lastFiveHoursRate.totalTokensPerHour,
+      lastFiveHoursRateConfidence: lastFiveHours.confidence,
+      lastDayTokensPerHour: lastDayRate.totalTokensPerHour,
+      lastDayRateConfidence: lastDay.confidence,
+      weeklyPercent: hourlyRateProjection,
+    },
+    freshness: {
+      latestEventAt: latest?.timestamp ?? null,
+      latestEventAgeMinutes:
+        latestEventAgeMinutes !== null
+          ? Math.round(latestEventAgeMinutes)
+          : null,
+      stale: (latestEventAgeMinutes ?? 0) > 120,
+      staleMinutes:
+        latestEventAgeMinutes !== null
+          ? Math.round(latestEventAgeMinutes)
+          : null,
     },
     timeline: buildHourlyTimeline(lastDayEvents, now),
     topSessions: buildSessionSummaries(usageEvents).slice(0, 8),
@@ -427,24 +592,37 @@ function buildSummary(
     accuracy: {
       known: [
         'Reads Codex token_count events from local session JSONL logs.',
-        'Uses cumulative total_token_usage deltas per session to avoid counting repeated UI refresh events.',
+        `Observed ${usageEvents.length.toLocaleString()} deduplicated local deltas from ${parseDiagnostics.tokenRecords.toLocaleString()} token events.`,
+        parseDiagnostics.fallbackTokenSourceUsed > 0
+          ? `${parseDiagnostics.fallbackTokenSourceUsed.toLocaleString()} records used last_token_usage fallback when total_token_usage was missing.`
+          : 'Uses total_token_usage as the primary cumulative counter.',
         'Uses Codex-provided rate limit percentages and reset timestamps when present.',
       ],
       estimated: [
         'Burn rate is a rolling local observation, not a server-side billing or quota statement.',
         'Active burn separates uncached input, output, and reasoning tokens from cached input when metadata includes cache counts.',
-        'Projection assumes the recent weekly percent trend continues until reset.',
+        `Window rates are normalized by observed minutes to avoid fixed-time assumptions (${Math.round(lastHour.observedMinutes)}m / ${Math.round(lastFiveHours.observedMinutes)}m / ${Math.round(lastDay.observedMinutes)}m).`,
+        `Projection uses an EMA-weighted linear trend and reports confidence before producing an exhaust estimate.`,
       ],
       caveats: [
         'ChatGPT plan usage may include activity outside local Codex logs.',
         'Codex app meter and local metadata can disagree if they are updated on different cadences or include different products.',
-        'Archived or moved session files are included only when they exist under the detected Codex home.',
+        parseDiagnostics.malformedLines > 0
+          ? `${parseDiagnostics.malformedLines} malformed lines were skipped while parsing logs.`
+          : 'Parser accepted all discovered token_count lines.',
+        `Observed deltas were filtered for counter resets (${parseDiagnostics.resetEvents}) and likely anomalies (${parseDiagnostics.anomalousDeltas}).`,
       ],
     },
   }
 }
 
-function buildUsageEvents(events: TokenEvent[]): UsageEvent[] {
+function buildUsageEvents(events: TokenEvent[]): {
+  events: UsageEvent[]
+  resetEvents: number
+  anomalousDeltas: number
+  ignoredEvents: number
+  usageMethodDescription: string
+} {
   const bySession = new Map<string, TokenEvent[]>()
 
   events.forEach((event) => {
@@ -454,25 +632,71 @@ function buildUsageEvents(events: TokenEvent[]): UsageEvent[] {
   })
 
   const usageEvents: UsageEvent[] = []
+  let resetEvents = 0
+  let anomalousDeltas = 0
+  let ignoredEvents = 0
 
   bySession.forEach((sessionEvents) => {
     sessionEvents.sort((a, b) => a.timestampMs - b.timestampMs)
     let previous = emptyTotals()
+    let previousTimestampMs = NaN
+    let hasSeenFirst = false
 
     sessionEvents.forEach((event) => {
       const current = toTotals(event.totals)
-      const delta = subtractPositive(current, previous)
-      previous = current
+      const elapsedMinutes =
+        hasSeenFirst && Number.isFinite(previousTimestampMs)
+          ? Math.max(0.25, (event.timestampMs - previousTimestampMs) / 60000)
+          : 0
 
-      if (delta.totalTokens > 0) {
-        usageEvents.push({ ...event, delta })
+      const delta = subtractPositive(current, previous)
+      const droppedCounter =
+        hasSeenFirst && Number.isFinite(previous.totalTokens)
+          ? current.totalTokens < previous.totalTokens
+          : false
+      const isHugeSpike =
+        hasSeenFirst &&
+        delta.totalTokens > 0 &&
+        delta.totalTokens / elapsedMinutes > 250_000
+      const shouldIgnore = droppedCounter || isHugeSpike
+
+      if (!hasSeenFirst) {
+        previous = current
+        previousTimestampMs = event.timestampMs
+        hasSeenFirst = true
+        return
       }
+
+      if (shouldIgnore) {
+        ignoredEvents += 1
+        if (droppedCounter) {
+          resetEvents += 1
+        } else if (isHugeSpike) {
+          anomalousDeltas += 1
+        }
+      } else {
+        if (!hasSeenFirst || delta.totalTokens > 0) {
+          usageEvents.push({ ...event, delta })
+        }
+      }
+
+      previous = current
+      previousTimestampMs = event.timestampMs
+      hasSeenFirst = true
     })
   })
 
-  return usageEvents.sort((a, b) => a.timestampMs - b.timestampMs)
-}
+  const ordered = usageEvents.sort((a, b) => a.timestampMs - b.timestampMs)
 
+  return {
+    events: ordered,
+    resetEvents,
+    anomalousDeltas,
+    ignoredEvents,
+    usageMethodDescription:
+      'Per-session cumulative deltas with reset and anomalous-delta protections.',
+  }
+}
 function buildAlerts(
   summary: UsageSummary,
   history: UsageSummary['history'],
@@ -480,34 +704,77 @@ function buildAlerts(
   const alerts: GaugeAlert[] = []
   const weekly = summary.limits.secondary.usedPercent
   const primary = summary.limits.primary.usedPercent
+  const previousWeek = history.previous?.weeklyUsedPercent ?? null
+  const previousPrimary = history.previous?.primaryUsedPercent ?? null
+  const projection = summary.rates.weeklyPercent
+  const parseRisk =
+    summary.source.parseDiagnostics.parseFailures +
+      summary.source.parseDiagnostics.malformedLines >
+    Math.max(1, summary.source.parseDiagnostics.parsedLines * 0.05)
+  const applyQuality = (severity: GaugeAlert['severity']) =>
+    downgradeSeverity(
+      summary.rates.lastHourRateConfidence.level === 'low' || parseRisk
+        ? downgradeSeverity(severity)
+        : severity,
+    )
 
-  if (weekly !== null && weekly >= 95) {
+  const staleMinutes = summary.freshness.staleMinutes
+  if (staleMinutes !== null && staleMinutes > 240) {
+    alerts.push({
+      id: 'local-stale-critical',
+      severity: 'danger',
+      title: 'Local usage logs stale',
+      detail: `No token_count event in the last ${Math.round(staleMinutes)} minutes.`,
+    })
+  } else if (staleMinutes !== null && staleMinutes > 120) {
+    alerts.push({
+      id: 'local-stale',
+      severity: 'warning',
+      title: 'Local usage logs stale',
+      detail: `No token_count event in the last ${Math.round(staleMinutes)} minutes.`,
+    })
+  }
+
+  if (
+    weekly !== null &&
+    shouldAlertWithHysteresis(weekly, previousWeek, 95, 90)
+  ) {
     alerts.push({
       id: 'weekly-critical',
-      severity: 'danger',
+      severity: applyQuality('danger'),
       title: 'Weekly limit almost gone',
       detail: `Codex metadata reports ${weekly.toFixed(0)}% of the weekly window used.`,
     })
-  } else if (weekly !== null && weekly >= 85) {
+  } else if (
+    weekly !== null &&
+    shouldAlertWithHysteresis(weekly, previousWeek, 85, 82)
+  ) {
     alerts.push({
       id: 'weekly-warning',
-      severity: 'warning',
+      severity: applyQuality('warning'),
       title: 'Weekly limit getting tight',
       detail: `Codex metadata reports ${weekly.toFixed(0)}% of the weekly window used.`,
     })
-  } else if (weekly !== null && weekly >= 70) {
+  } else if (
+    weekly !== null &&
+    shouldAlertWithHysteresis(weekly, previousWeek, 70, 67)
+  ) {
     alerts.push({
       id: 'weekly-watch',
-      severity: 'info',
+      severity:
+        summary.rates.weeklyPercent.confidence.level === 'low' ? 'warning' : 'info',
       title: 'Weekly limit watch',
       detail: `Codex metadata reports ${weekly.toFixed(0)}% of the weekly window used.`,
     })
   }
 
-  if (primary !== null && primary >= 80) {
+  if (
+    primary !== null &&
+    shouldAlertWithHysteresis(primary, previousPrimary, 85, 82)
+  ) {
     alerts.push({
       id: 'short-window',
-      severity: primary >= 95 ? 'danger' : 'warning',
+      severity: applyQuality(primary >= 95 ? 'danger' : 'warning'),
       title: 'Short window running hot',
       detail: `The short rolling window is at ${primary.toFixed(0)}%.`,
     })
@@ -516,20 +783,34 @@ function buildAlerts(
   if (summary.rates.lastHourActiveTokensPerHour >= 1_000_000) {
     alerts.push({
       id: 'active-burn-rate',
-      severity: 'warning',
+      severity: applyQuality(
+        summary.rates.lastHourRateConfidence.level === 'low' ? 'info' : 'warning',
+      ),
       title: 'High active burn rate',
       detail: `${formatCompact(summary.rates.lastHourActiveTokensPerHour)} active tokens observed in the last hour.`,
     })
   }
 
-  const projection = summary.rates.weeklyPercent.projectedExhaustAt
+  const projectedAt = projection.projectedExhaustAt
   const reset = summary.limits.secondary.resetsAt
-  if (projection && reset && Date.parse(projection) < Date.parse(reset)) {
+  if (
+    projection.confidence.level === 'high' &&
+    projectedAt &&
+    reset &&
+    Date.parse(projectedAt) < Date.parse(reset)
+  ) {
     alerts.push({
       id: 'projection-before-reset',
       severity: 'danger',
       title: 'Projected to hit 100% before reset',
-      detail: `Recent trend projects exhaustion around ${new Date(projection).toLocaleString()}.`,
+      detail: `Recent trend projects exhaustion around ${new Date(projectedAt).toLocaleString()}.`,
+    })
+  } else if (projection.confidence.level === 'low' && projection.percentPerHour !== null) {
+    alerts.push({
+      id: 'projection-unreliable',
+      severity: 'info',
+      title: 'Projection confidence low',
+      detail: `Current exhaustion estimate is low-confidence: ${projection.confidence.reason}.`,
     })
   }
 
@@ -539,12 +820,19 @@ function buildAlerts(
     const delta = latest.weeklyUsedPercent !== null && previous.weeklyUsedPercent !== null
       ? latest.weeklyUsedPercent - previous.weeklyUsedPercent
       : 0
-    if (delta >= 5) {
+    if (delta >= 6) {
       alerts.push({
         id: 'history-jump',
         severity: 'warning',
         title: 'Usage jumped since last sample',
         detail: `Weekly metadata rose ${delta.toFixed(1)} points between history samples.`,
+      })
+    } else if (delta <= -2 && latest.weeklyUsedPercent !== null && latest.weeklyUsedPercent < 90) {
+      alerts.push({
+        id: 'history-dropped',
+        severity: 'info',
+        title: 'Usage trend eased',
+        detail: `Weekly metadata dropped ${Math.abs(delta).toFixed(1)} points since last sample.`,
       })
     }
   }
@@ -559,6 +847,33 @@ function buildAlerts(
   }
 
   return alerts
+}
+
+function shouldAlertWithHysteresis(
+  current: number,
+  previous: number | null,
+  enterThreshold: number,
+  clearThreshold: number,
+): boolean {
+  if (current >= enterThreshold) {
+    return true
+  }
+  if (previous === null) {
+    return false
+  }
+  return previous >= enterThreshold && current >= clearThreshold
+}
+
+function downgradeSeverity(
+  severity: GaugeAlert['severity'],
+): GaugeAlert['severity'] {
+  if (severity === 'info') {
+    return 'info'
+  }
+  if (severity === 'warning') {
+    return 'info'
+  }
+  return 'warning'
 }
 
 async function recordHistory(
@@ -653,6 +968,37 @@ function normalizeBucket(value: unknown): TokenBucket {
   }
 }
 
+function parseTotals(
+  payloadInfo: unknown,
+): { totals: TokenBucket; source: 'total' | 'last' } | null {
+  if (!payloadInfo || typeof payloadInfo !== 'object') {
+    return null
+  }
+
+  const info = payloadInfo as Record<string, unknown>
+  const totalTotals = normalizeBucket(info.total_token_usage)
+  if (hasAnyTotals(totalTotals)) {
+    return { totals: totalTotals, source: 'total' }
+  }
+
+  const lastTotals = normalizeBucket(info.last_token_usage)
+  if (hasAnyTotals(lastTotals)) {
+    return { totals: lastTotals, source: 'last' }
+  }
+
+  return null
+}
+
+function hasAnyTotals(bucket: TokenBucket): boolean {
+  return (
+    bucket.input_tokens !== undefined ||
+    bucket.cached_input_tokens !== undefined ||
+    bucket.output_tokens !== undefined ||
+    bucket.reasoning_output_tokens !== undefined ||
+    bucket.total_tokens !== undefined
+  )
+}
+
 function normalizeWindow(value: unknown): RateWindow | null {
   if (!value || typeof value !== 'object') {
     return null
@@ -667,9 +1013,14 @@ function normalizeWindow(value: unknown): RateWindow | null {
 }
 
 function numberOrUndefined(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value)
-    ? value
-    : undefined
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : undefined
+  }
+  return undefined
 }
 
 function toTotals(bucket: TokenBucket | undefined): TokenTotals {
@@ -705,19 +1056,6 @@ function eventsSince<T extends { timestampMs: number }>(
   cutoffMs: number,
 ): T[] {
   return events.filter((event) => event.timestampMs >= cutoffMs)
-}
-
-function summarizeEvents(events: UsageEvent[]): WindowSummary {
-  const totals = events.reduce(
-    (sum, event) => addTotals(sum, event.delta),
-    emptyTotals(),
-  )
-
-  return {
-    ...totals,
-    activeTokens: activeTokens(totals),
-    eventCount: events.length,
-  }
 }
 
 function buildHourlyTimeline(events: UsageEvent[], now: number): HourBucket[] {
@@ -762,6 +1100,115 @@ function buildHourlyTimeline(events: UsageEvent[], now: number): HourBucket[] {
   }))
 }
 
+function summarizeWindow(
+  events: UsageEvent[],
+  windowStartMs: number,
+  windowEndMs: number,
+): WindowSummary {
+  const totals = events.reduce(
+    (sum, event) => addTotals(sum, event.delta),
+    emptyTotals(),
+  )
+
+  if (events.length === 0) {
+    return {
+      ...totals,
+      activeTokens: activeTokens(totals),
+      eventCount: 0,
+      observedMinutes: 0,
+      coveragePercent: 0,
+      confidence: {
+        level: 'low',
+        score: 0.12,
+        reason: `No events observed in this ${Math.round((windowEndMs - windowStartMs) / 60000)}m window.`,
+      },
+    }
+  }
+
+  const firstEventTime = events.at(0)?.timestampMs ?? windowEndMs
+  const lastEventTime = events.at(-1)?.timestampMs ?? windowEndMs
+  const spanMinutes = Math.max(1, (windowEndMs - windowStartMs) / 60000)
+  const observedSpan = Math.max(
+    0,
+    (lastEventTime - firstEventTime) / 60000,
+  )
+  const observedMinutes = Math.min(spanMinutes, observedSpan)
+  const coveragePercent = (observedMinutes / spanMinutes) * 100
+  const latestEventAgeMinutes = Math.max(0, (windowEndMs - lastEventTime) / 60000)
+  const confidence = assessRateConfidence({
+    observedMinutes: Math.min(spanMinutes, observedSpan),
+    spanMinutes,
+    eventCount: events.length,
+    latestEventAgeMinutes,
+  })
+
+  return {
+    ...totals,
+    activeTokens: activeTokens(totals),
+    eventCount: events.length,
+    observedMinutes: Math.max(0, observedMinutes),
+    coveragePercent,
+    confidence,
+  }
+}
+
+function perWindowRates(window: WindowSummary): {
+  totalTokensPerHour: number
+  activeTokensPerHour: number
+} {
+  const elapsedHours = Math.max(window.observedMinutes / 60, 0)
+  if (window.eventCount <= 1 && window.observedMinutes <= 5) {
+    return { totalTokensPerHour: 0, activeTokensPerHour: 0 }
+  }
+  if (window.observedMinutes <= 2) {
+    return { totalTokensPerHour: 0, activeTokensPerHour: 0 }
+  }
+
+  return {
+    totalTokensPerHour: window.totalTokens / elapsedHours,
+    activeTokensPerHour: window.activeTokens / elapsedHours,
+  }
+}
+
+function assessRateConfidence(params: {
+  observedMinutes: number
+  spanMinutes: number
+  eventCount: number
+  latestEventAgeMinutes: number
+}): DataConfidence {
+  if (params.observedMinutes <= 0 || params.eventCount === 0) {
+    return {
+      level: 'low',
+      score: 0.11,
+      reason: 'No observed usage samples in this window.',
+    }
+  }
+
+  const coverage = params.observedMinutes / Math.max(1, params.spanMinutes)
+  const eventDensity = params.eventCount / Math.max(0.25, params.observedMinutes / 60)
+  if (coverage >= 0.75 && eventDensity >= 2 && params.latestEventAgeMinutes <= 45) {
+    return {
+      level: 'high',
+      score: 0.84,
+      reason: 'Good event density with recent samples and strong window coverage.',
+    }
+  }
+
+  if (coverage >= 0.35 && eventDensity >= 1 && params.latestEventAgeMinutes <= 120) {
+    return {
+      level: 'medium',
+      score: 0.57,
+      reason: 'Moderate event coverage; burn estimate is less precise.',
+    }
+  }
+
+  return {
+    level: 'low',
+    score: 0.22,
+    reason: 'Sparse samples or stale events reduce rate confidence.',
+  }
+}
+
 function buildSessionSummaries(events: UsageEvent[]): SessionSummary[] {
   const bySession = new Map<string, SessionSummary>()
 
@@ -801,29 +1248,141 @@ function projectPercent(events: TokenEvent[], now: number): PercentProjection {
   const percentEvents = events
     .filter((event) => typeof event.secondary?.used_percent === 'number')
     .filter((event) => event.timestampMs >= now - 24 * 60 * 60 * 1000)
+    .map((event) => ({
+      x: event.timestampMs,
+      y: event.secondary?.used_percent ?? 0,
+    }))
+    .sort((a, b) => a.x - b.x)
 
-  if (percentEvents.length < 2) {
-    return { percentPerHour: null, projectedExhaustAt: null, basisHours: null }
+  if (percentEvents.length < 3) {
+    return {
+      percentPerHour: null,
+      projectedExhaustAt: null,
+      basisHours: null,
+      confidence: {
+        level: 'low',
+        score: 0.2,
+        reason: 'Too few weekly-percent samples in the last 24h for trend.',
+      },
+    }
   }
 
-  const first = percentEvents[0]
-  const last = percentEvents.at(-1)!
-  const hours = (last.timestampMs - first.timestampMs) / 3_600_000
-  const delta =
-    (last.secondary?.used_percent ?? 0) - (first.secondary?.used_percent ?? 0)
-
-  if (hours <= 0 || delta <= 0) {
-    return { percentPerHour: 0, projectedExhaustAt: null, basisHours: hours }
+  const alpha = 0.45
+  const smoothed: { x: number; y: number }[] = []
+  for (const point of percentEvents) {
+    const previous = smoothed.at(-1)
+    smoothed.push({
+      x: point.x,
+      y:
+        previous === undefined
+          ? point.y
+          : point.y * alpha + previous.y * (1 - alpha),
+    })
   }
 
-  const percentPerHour = delta / hours
-  const remaining = Math.max(0, 100 - (last.secondary?.used_percent ?? 0))
-  const projectedMs = last.timestampMs + (remaining / percentPerHour) * 3_600_000
+  const basisMs = smoothed.at(-1)!.x - smoothed[0].x
+  const basisHours = basisMs / 3_600_000
+  if (!Number.isFinite(basisHours) || basisHours <= 0) {
+    return {
+      percentPerHour: null,
+      projectedExhaustAt: null,
+      basisHours: null,
+      confidence: {
+        level: 'low',
+        score: 0.13,
+        reason: 'Weekly-percent sample window duration was invalid.',
+      },
+    }
+  }
+
+  const xMean = smoothed.reduce((sum, point) => sum + point.x, 0) / smoothed.length
+  const yMean =
+    smoothed.reduce((sum, point) => sum + point.y, 0) / smoothed.length
+
+  const { numerator, denominator } = smoothed.reduce(
+    (agg, point) => {
+      const xDelta = point.x - xMean
+      const yDelta = point.y - yMean
+      return {
+        numerator: agg.numerator + xDelta * yDelta,
+        denominator: agg.denominator + xDelta * xDelta,
+      }
+    },
+    { numerator: 0, denominator: 0 },
+  )
+
+  if (denominator <= 0) {
+    return {
+      percentPerHour: null,
+      projectedExhaustAt: null,
+      basisHours,
+      confidence: {
+        level: 'low',
+        score: 0.1,
+        reason: 'Cannot compute a reliable linear trend from weekly-percent samples.',
+      },
+    }
+  }
+
+  const msPerHour = 3_600_000
+  const trendPerMs = numerator / denominator
+  const percentPerHour = trendPerMs * msPerHour
+  const residuals = smoothed.map((point) => {
+    const expected =
+      yMean + trendPerMs * (point.x - xMean)
+    return Math.abs(expected - point.y)
+  })
+  const averageResidual = residuals.reduce((sum, value) => sum + value, 0) / residuals.length
+
+  const finalWindow = smoothed.at(-1)!
+  const finalValue = finalWindow.y
+
+  const confidence =
+    smoothed.length >= 8 && averageResidual <= 2.4 && percentPerHour > 0
+      ? {
+          level: 'high' as const,
+          score: 0.88,
+          reason:
+            'Strong short-history linear trend across recent percent samples.',
+        }
+      : smoothed.length >= 5 && averageResidual <= 4.5
+        ? {
+            level: 'medium' as const,
+            score: 0.64,
+            reason: 'Moderate trend confidence; estimate is directional.',
+          }
+        : {
+            level: 'low' as const,
+            score: 0.24,
+            reason: 'Trend residuals are noisy; no reliable percent trend.',
+          }
+
+  if (percentPerHour <= 0) {
+    return {
+      percentPerHour: 0,
+      projectedExhaustAt: null,
+      basisHours,
+      confidence,
+    }
+  }
+
+  if (confidence.level === 'low') {
+    return {
+      percentPerHour: null,
+      projectedExhaustAt: null,
+      basisHours,
+      confidence,
+    }
+  }
+
+  const remaining = Math.max(0, 100 - finalValue)
+  const projectedMs = finalWindow.x + (remaining / percentPerHour) * msPerHour
 
   return {
     percentPerHour,
     projectedExhaustAt: new Date(projectedMs).toISOString(),
-    basisHours: hours,
+    basisHours,
+    confidence,
   }
 }
 

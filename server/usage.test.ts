@@ -29,11 +29,48 @@ describe('usage parser', () => {
       useCache: false,
     })
 
-    expect(summary.source.eventsFound).toBe(2)
-    expect(summary.windows.lastHour.totalTokens).toBe(240)
-    expect(summary.windows.lastHour.cachedInputTokens).toBe(140)
-    expect(summary.windows.lastHour.uncachedInputTokens).toBe(80)
+    expect(summary.source.eventsFound).toBe(1)
+    expect(summary.windows.lastHour.totalTokens).toBe(130)
+    expect(summary.windows.lastHour.cachedInputTokens).toBe(60)
+    expect(summary.windows.lastHour.uncachedInputTokens).toBe(60)
     expect(summary.limits.secondary.usedPercent).toBe(45)
+  })
+
+  it('uses last_token_usage when total_token_usage is missing', async () => {
+    const { codexHome, dataDir } = await createFixture([
+      tokenLineWithBuckets(
+        '2026-05-25T10:00:00.000Z',
+        {
+          total: null,
+          last: bucket(120, 50, 20, 5, 40),
+        },
+        44,
+        91,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:10:00.000Z',
+        {
+          total: null,
+          last: bucket(280, 140, 40, 10, 100),
+        },
+        51,
+        99,
+      ),
+    ])
+
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.source.parseDiagnostics.fallbackTokenSourceUsed).toBe(2)
+    expect(summary.source.parseDiagnostics.tokenRecords).toBe(2)
+    expect(summary.source.eventsFound).toBe(1)
+    expect(summary.windows.lastHour.totalTokens).toBe(60)
+    expect(summary.windows.lastHour.cachedInputTokens).toBe(90)
   })
 
   it('skips partial JSON lines and records history once per minute', async () => {
@@ -58,6 +95,213 @@ describe('usage parser', () => {
     expect(first.history.samples).toHaveLength(1)
     expect(second.history.samples).toHaveLength(1)
     expect(second.alerts.some((alert) => alert.id === 'weekly-warning')).toBe(true)
+  })
+
+  it('ignores counter resets and anomalous spikes, and reports ignored events', async () => {
+    const lines = [
+      tokenLineWithBuckets(
+        '2026-05-25T10:00:00.000Z',
+        {
+          total: bucket(120, 40, 10, 5, 175),
+          last: bucket(120, 40, 10, 5, 175),
+        },
+        20,
+        40,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:01:00.000Z',
+        {
+          total: bucket(100, 30, 8, 2, 140),
+          last: bucket(100, 30, 8, 2, 140),
+        },
+        25,
+        43,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:02:00.000Z',
+        {
+          total: bucket(140, 35, 10, 3, 188),
+          last: bucket(140, 35, 10, 3, 188),
+        },
+        27,
+        47,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:03:00.000Z',
+        {
+          total: bucket(500588, 35, 10, 3, 500713),
+          last: bucket(500588, 35, 10, 3, 500713),
+        },
+        28,
+        48,
+      ),
+    ]
+
+    const { codexHome, dataDir } = await createFixture(lines)
+
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:04:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.source.parseDiagnostics.resetEvents).toBe(1)
+    expect(summary.source.parseDiagnostics.anomalousDeltas).toBe(1)
+    expect(summary.source.ignoredEvents).toBe(2)
+    expect(summary.source.eventsFound).toBe(1)
+    expect(summary.windows.lastHour.totalTokens).toBe(48)
+  })
+
+  it('uses observed elapsed minutes for sparse 5h/last-hour rates', async () => {
+    const lines = [
+      tokenLineWithBuckets(
+        '2026-05-25T09:30:00.000Z',
+        {
+          total: bucket(1000, 300, 120, 10, 1430),
+          last: bucket(1000, 300, 120, 10, 1430),
+        },
+        30,
+        45,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:40:00.000Z',
+        {
+          total: bucket(1600, 300, 180, 14, 1794),
+          last: bucket(1600, 300, 180, 14, 1794),
+        },
+        31,
+        46,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T10:10:00.000Z',
+        {
+          total: bucket(1300, 300, 150, 12, 1662),
+          last: bucket(1300, 300, 150, 12, 1662),
+        },
+        30,
+        45,
+      ),
+    ]
+
+    const { codexHome, dataDir } = await createFixture(lines)
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:50:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.windows.lastHour.observedMinutes).toBe(30)
+    expect(summary.rates.lastHourTokensPerHour).toBeCloseTo(728) // 364 tokens across 30m -> 728/hr
+    expect(summary.rates.lastFiveHoursTokensPerHour).toBeCloseTo(728)
+  })
+})
+
+describe('projection confidence', () => {
+  it('uses linear trend with confidence for stable growth', async () => {
+    const lines = [
+      ...Array.from({ length: 10 }, (_, index) => {
+        const minute = index * 3600_000
+        const usedPercent = 20 + index * 1.5
+        return tokenLineWithBuckets(
+          new Date(Date.parse('2026-05-25T00:00:00.000Z') + minute).toISOString(),
+          {
+            total: bucket(100 + index * 120, 30, 20, 5, 155 + index * 120),
+            last: bucket(100 + index * 120, 30, 20, 5, 155 + index * 120),
+          },
+          12 + index,
+          usedPercent,
+        )
+      }),
+    ]
+
+    const { codexHome, dataDir } = await createFixture(lines)
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T09:00:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    const projection = summary.rates.weeklyPercent
+    expect(projection.percentPerHour).toBeGreaterThan(0)
+    expect(projection.projectedExhaustAt).toBeTypeOf('string')
+    expect(projection.confidence.level).toBe('high')
+    expect(projection.confidence.reason).toContain('Strong')
+  })
+
+  it('suppresses noisy weekly trend estimates when variance is high', async () => {
+    const lines = [
+      ...Array.from({ length: 10 }, (_, index) => {
+        const minute = index * 3600_000
+        const usedPercent = 40 + (index % 2 ? 32 : 0) - (index % 3 === 0 ? 6 : 0)
+        return tokenLineWithBuckets(
+          new Date(Date.parse('2026-05-25T00:00:00.000Z') + minute).toISOString(),
+          {
+            total: bucket(100 + index * 20, 30, 20, 5, 155 + index * 20),
+            last: bucket(100 + index * 20, 30, 20, 5, 155 + index * 20),
+          },
+          10 + (index % 4),
+          usedPercent,
+        )
+      }),
+    ]
+
+    const { codexHome, dataDir } = await createFixture(lines)
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T09:00:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    const projection = summary.rates.weeklyPercent
+    expect(projection.confidence.level).toBe('low')
+    expect(projection.percentPerHour).toBeNull()
+    expect(projection.projectedExhaustAt).toBeNull()
+  })
+
+  it('returns no trend when insufficient weekly samples are available', async () => {
+    const lines = [
+      tokenLineWithBuckets(
+        '2026-05-25T08:00:00.000Z',
+        {
+          total: bucket(1000, 300, 120, 10, 1430),
+          last: bucket(1000, 300, 120, 10, 1430),
+        },
+        30,
+        45,
+      ),
+      tokenLineWithBuckets(
+        '2026-05-25T12:00:00.000Z',
+        {
+          total: bucket(1600, 300, 180, 14, 1794),
+          last: bucket(1600, 300, 180, 14, 1794),
+        },
+        30,
+        46,
+      ),
+    ]
+
+    const { codexHome, dataDir } = await createFixture(lines)
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T12:05:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    const projection = summary.rates.weeklyPercent
+    expect(projection.percentPerHour).toBeNull()
+    expect(projection.projectedExhaustAt).toBeNull()
+    expect(projection.basisHours).toBeNull()
+    expect(projection.confidence.level).toBe('low')
   })
 })
 
@@ -88,28 +332,78 @@ function tokenLine(
   primaryUsed: number,
   secondaryUsed: number,
 ) {
+  return tokenLineWithBuckets(
+    timestamp,
+    {
+      total: {
+        input_tokens: inputTokens,
+        cached_input_tokens: cachedInputTokens,
+        output_tokens: outputTokens,
+        reasoning_output_tokens: reasoningOutputTokens,
+        total_tokens: totalTokens,
+      },
+      last: {
+        input_tokens: inputTokens,
+        cached_input_tokens: cachedInputTokens,
+        output_tokens: outputTokens,
+        reasoning_output_tokens: reasoningOutputTokens,
+        total_tokens: totalTokens,
+      },
+    },
+    primaryUsed,
+    secondaryUsed,
+  )
+}
+
+type BucketShape = {
+  input_tokens: number
+  cached_input_tokens: number
+  output_tokens: number
+  reasoning_output_tokens: number
+  total_tokens: number
+}
+
+function bucket(
+  inputTokens: number,
+  cachedInputTokens: number,
+  outputTokens: number,
+  reasoningOutputTokens: number,
+  totalTokens: number,
+): BucketShape {
+  return {
+    input_tokens: inputTokens,
+    cached_input_tokens: cachedInputTokens,
+    output_tokens: outputTokens,
+    reasoning_output_tokens: reasoningOutputTokens,
+    total_tokens: totalTokens,
+  }
+}
+
+function tokenLineWithBuckets(
+  timestamp: string,
+  buckets: {
+    total: BucketShape | null
+    last: BucketShape | null
+  },
+  primaryUsed: number,
+  secondaryUsed: number,
+) {
+  const info: Record<string, unknown> = {
+    model_context_window: 258400,
+  }
+  if (buckets.total !== null) {
+    info.total_token_usage = buckets.total
+  }
+  if (buckets.last !== null) {
+    info.last_token_usage = buckets.last
+  }
+
   return JSON.stringify({
     timestamp,
     type: 'event_msg',
     payload: {
       type: 'token_count',
-      info: {
-        total_token_usage: {
-          input_tokens: inputTokens,
-          cached_input_tokens: cachedInputTokens,
-          output_tokens: outputTokens,
-          reasoning_output_tokens: reasoningOutputTokens,
-          total_tokens: totalTokens,
-        },
-        last_token_usage: {
-          input_tokens: inputTokens,
-          cached_input_tokens: cachedInputTokens,
-          output_tokens: outputTokens,
-          reasoning_output_tokens: reasoningOutputTokens,
-          total_tokens: totalTokens,
-        },
-        model_context_window: 258400,
-      },
+      info,
       rate_limits: {
         primary: {
           used_percent: primaryUsed,

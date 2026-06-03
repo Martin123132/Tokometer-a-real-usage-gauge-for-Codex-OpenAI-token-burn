@@ -10,9 +10,43 @@ type TokenTotals = {
   totalTokens: number
 }
 
+type ConfidenceLevel = 'high' | 'medium' | 'low'
+
+type DataConfidence = {
+  level: ConfidenceLevel
+  score: number
+  reason: string
+}
+
+type ParseFileHealth = {
+  file: string
+  parsedLines: number
+  malformedLines: number
+  parseFailures: number
+  tokenRecords: number
+  usedEvents: number
+  fallbackTokenSourceUsed: number
+}
+
+type ParseDiagnostics = {
+  parsedLines: number
+  malformedLines: number
+  parseFailures: number
+  tokenRecords: number
+  usedEvents: number
+  ignoredEvents: number
+  fallbackTokenSourceUsed: number
+  resetEvents: number
+  anomalousDeltas: number
+  files: ParseFileHealth[]
+}
+
 type WindowSummary = TokenTotals & {
   activeTokens: number
   eventCount: number
+  observedMinutes: number
+  coveragePercent: number
+  confidence: DataConfidence
 }
 
 type GaugeAlert = {
@@ -41,6 +75,9 @@ type UsageData = {
     filesScanned: number
     eventsFound: number
     sessionsFound: number
+    rawTokenRecords: number
+    ignoredEvents: number
+    parseDiagnostics: ParseDiagnostics
     generatedAt: string
   }
   latest: {
@@ -78,7 +115,14 @@ type UsageData = {
       percentPerHour: number | null
       projectedExhaustAt: string | null
       basisHours: number | null
+      confidence: DataConfidence
     }
+  }
+  freshness: {
+    latestEventAt: string | null
+    latestEventAgeMinutes: number | null
+    stale: boolean
+    staleMinutes: number | null
   }
   timeline: {
     hourStart: string
@@ -94,8 +138,8 @@ type UsageData = {
       eventCount: number
       firstSeen: string
       lastSeen: string
-    }
-  >
+        }
+    >
   alerts: GaugeAlert[]
   history: {
     samples: HistoryPoint[]
@@ -205,6 +249,30 @@ function App() {
     () => buildClientAlerts(data, visibleMeter, visiblePrimaryMeter, settings),
     [data, visibleMeter, visiblePrimaryMeter, settings],
   )
+  const staleAgeMinutes = data?.freshness.staleMinutes ?? null
+  const projectionConfidence = data?.rates.weeklyPercent.confidence ?? null
+  const hasLowConfidenceProjection =
+    projectionConfidence !== null && projectionConfidence.level === 'low'
+  const parseDiagnostics = data?.source.parseDiagnostics
+  const parseWarningRate =
+    (parseDiagnostics?.malformedLines ?? 0) + (parseDiagnostics?.parseFailures ?? 0)
+
+  const qualityNotes = useMemo(() => {
+    const items: string[] = []
+    if (staleAgeMinutes !== null && staleAgeMinutes > 180) {
+      items.push(`Local token log is stale (${Math.round(staleAgeMinutes)} min since last event).`)
+    }
+    if (parseWarningRate > 0) {
+      items.push('Some token log lines were skipped while parsing; confidence is reduced.')
+    }
+    if (parseDiagnostics?.ignoredEvents && parseDiagnostics.ignoredEvents > 0) {
+      items.push(`Ignored ${parseDiagnostics.ignoredEvents} noisy/reset token samples.`)
+    }
+    if (hasLowConfidenceProjection) {
+      items.push(`Projection confidence: ${projectionConfidence.level} - ${projectionConfidence.reason}`)
+    }
+    return items
+  }, [staleAgeMinutes, parseWarningRate, parseDiagnostics, hasLowConfidenceProjection, projectionConfidence])
 
   const setPrimaryMeterValue = (nextValue: string) => {
     setPrimaryMeterOverride(nextValue)
@@ -278,6 +346,9 @@ function App() {
             <h1>Tokometer</h1>
             <div className="meta-row">
               <StatusPill tone="known" label="Known Metadata" />
+              {hasLowConfidenceProjection || (data?.freshness.stale ?? false) ? (
+                <StatusPill tone="warning" label="Sample Warning" />
+              ) : null}
               <span>Token Gauge</span>
               <span>{formatPlan(data?.latest.planType)}</span>
               <span>{data?.source.eventsFound.toLocaleString()} events</span>
@@ -300,6 +371,14 @@ function App() {
             </button>
           </div>
         </header>
+
+        {qualityNotes.length > 0 ? (
+          <section className="sample-warning-strip">
+            {qualityNotes.map((note) => (
+              <p key={note}>{note}</p>
+            ))}
+          </section>
+        ) : null}
 
         {error ? <div className="inline-error">{error}</div> : null}
 
@@ -687,9 +766,37 @@ function StatusPill({
   tone,
 }: {
   label: string
-  tone: 'known' | 'estimated'
+  tone: 'known' | 'estimated' | 'warning'
 }) {
   return <span className={`status-pill ${tone}`}>{label}</span>
+}
+
+function ConfidenceTile({
+  label,
+  value,
+  detail,
+  footer,
+}: {
+  label: string
+  value: string | number
+  detail: string
+  footer?: string
+}) {
+  return (
+    <div className="confidence-tile">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <em>{detail}</em>
+      {footer ? <small>{footer}</small> : null}
+    </div>
+  )
+}
+
+function formatConfidenceText(confidence?: DataConfidence | null): string {
+  if (!confidence) {
+    return 'No confidence metadata'
+  }
+  return `${confidence.level} (${Math.round(confidence.score * 100)}%)`
 }
 
 function Gauge({
@@ -960,12 +1067,74 @@ function AccuracyPanel({
 }) {
   const primaryMetadataPercent = data?.limits.primary.usedPercent ?? 0
   const weeklyMetadataPercent = data?.limits.secondary.usedPercent ?? 0
+  const freshness = data?.freshness
+  const parseDiagnostics = data?.source.parseDiagnostics
+  const lastHourConfidence = data?.windows.lastHour.confidence
+  const lastFiveConfidence = data?.windows.lastFiveHours.confidence
+  const lastDayConfidence = data?.windows.lastDay.confidence
+  const projectedConfidence = data?.rates.weeklyPercent.confidence
 
   return (
     <section className="instrument-panel accuracy-panel">
       <div className="panel-heading">
         <h2>Known vs Estimated</h2>
         <span>Portable parser</span>
+      </div>
+      <div className="sample-confidence">
+        <div className="sample-confidence-header">
+          <h3>Sample confidence</h3>
+          <StatusPill
+            tone={freshness?.stale ? 'warning' : 'known'}
+            label={freshness?.stale ? 'Stale Data' : 'Live Enough'}
+          />
+        </div>
+        <div className="sample-confidence-grid">
+          <ConfidenceTile
+            label="Latest event"
+            value={
+              freshness?.latestEventAgeMinutes === null || freshness?.latestEventAgeMinutes === undefined
+                ? 'never'
+                : `${Math.round(freshness?.latestEventAgeMinutes ?? 0)}m ago`
+            }
+            detail={
+              freshness?.latestEventAt
+                ? `At ${new Date(freshness.latestEventAt).toLocaleTimeString()}`
+                : 'No valid events'
+            }
+          />
+          <ConfidenceTile
+            label="Last hour coverage"
+            value={Math.round(data?.windows.lastHour.coveragePercent ?? 0)}
+            detail={`${Math.round(data?.windows.lastHour.observedMinutes ?? 0)}m observed`}
+            footer={formatConfidenceText(lastHourConfidence)}
+          />
+          <ConfidenceTile
+            label="5h coverage"
+            value={Math.round(data?.windows.lastFiveHours.coveragePercent ?? 0)}
+            detail={`${Math.round(data?.windows.lastFiveHours.observedMinutes ?? 0)}m observed`}
+            footer={formatConfidenceText(lastFiveConfidence)}
+          />
+          <ConfidenceTile
+            label="24h coverage"
+            value={Math.round(data?.windows.lastDay.coveragePercent ?? 0)}
+            detail={`${Math.round(data?.windows.lastDay.observedMinutes ?? 0)}m observed`}
+            footer={formatConfidenceText(lastDayConfidence)}
+          />
+          <ConfidenceTile
+            label="Projection"
+            value={projectedConfidence?.level ?? 'unknown'}
+            detail={
+              projectedConfidence?.reason ??
+              'Waiting for enough weekly usage samples'
+            }
+          />
+          <ConfidenceTile
+            label="Parse quality"
+            value={`${parseDiagnostics?.parsedLines?.toLocaleString() ?? 0} lines`}
+            detail={`${parseDiagnostics?.usedEvents?.toLocaleString() ?? 0} events kept, ${parseDiagnostics?.ignoredEvents?.toLocaleString() ?? 0} skipped`}
+            footer={`Fallback totals: ${parseDiagnostics?.fallbackTokenSourceUsed?.toLocaleString() ?? 0}`}
+          />
+        </div>
       </div>
       <div className="accuracy-meter">
         <MeterComparisonRow
@@ -1089,6 +1258,26 @@ function buildClientAlerts(
   const primaryDelta = visiblePrimaryMeter - primaryMetadataPercent
   const weeklyMetadataPercent = data.limits.secondary.usedPercent ?? 0
   const weeklyDelta = visibleMeter - weeklyMetadataPercent
+  const projectionConfidence = data.rates.weeklyPercent.confidence
+
+  if (data.freshness.stale && Number.isFinite(data.freshness.latestEventAgeMinutes)) {
+    const staleMinutes = data.freshness.staleMinutes ?? 0
+    alerts.unshift({
+      id: 'ui-stale-data',
+      severity: staleMinutes >= 240 ? 'danger' : 'warning',
+      title: 'Stale local samples',
+      detail: `No token event in ${Math.round(staleMinutes)} minutes.`,
+    })
+  }
+
+  if (projectionConfidence.level === 'low' && projectionConfidence.reason) {
+    alerts.unshift({
+      id: 'ui-projection-noise',
+      severity: 'warning',
+      title: 'Projection confidence low',
+      detail: projectionConfidence.reason,
+    })
+  }
 
   if (Number.isFinite(weeklyDelta) && Math.abs(weeklyDelta) >= settings.mismatchThreshold) {
     alerts.unshift({
@@ -1146,6 +1335,10 @@ function createMarkdownReport(data: UsageData) {
     `- 5h window: ${formatPercent(data.limits.primary.usedPercent)}; resets ${formatDate(data.limits.primary.resetsAt)}`,
     `- Weekly window: ${formatPercent(data.limits.secondary.usedPercent)}; resets ${formatDate(data.limits.secondary.resetsAt)}`,
     `- Projection: ${formatProjection(data)}`,
+    `- Weekly trend confidence: ${data.rates.weeklyPercent.confidence.level} (${(data.rates.weeklyPercent.confidence.score * 100).toFixed(0)}%) - ${data.rates.weeklyPercent.confidence.reason}`,
+    `- Latest sample age: ${data.freshness.latestEventAgeMinutes ?? 0}m`,
+    `- Parse lines: ${data.source.parseDiagnostics.parsedLines} parsed, ${data.source.parseDiagnostics.malformedLines} malformed, ${data.source.parseDiagnostics.parseFailures} parse failures`,
+    `- Ignored samples: ${data.source.parseDiagnostics.ignoredEvents} (${data.source.parseDiagnostics.resetEvents} resets, ${data.source.parseDiagnostics.anomalousDeltas} anomalies)`,
     '',
     '## Burn',
     '',
@@ -1237,14 +1430,14 @@ function formatPlan(value?: string | null) {
 function formatProjection(data: UsageData | null) {
   const projection = data?.rates.weeklyPercent
   if (!projection || projection.percentPerHour === null) {
-    return 'No trend'
+    return `No trend (${projection?.confidence.level ?? 'unknown'} confidence)`
   }
   if (projection.percentPerHour === 0) {
-    return 'Stable'
+    return `Stable (${projection.confidence.level} confidence)`
   }
   return projection.projectedExhaustAt
-    ? formatDate(projection.projectedExhaustAt)
-    : `${projection.percentPerHour.toFixed(2)}%/hr`
+    ? `${formatDate(projection.projectedExhaustAt)} (${projection.confidence.level} confidence)`
+    : `${projection.percentPerHour.toFixed(2)}%/hr (${projection.confidence.level} confidence)`
 }
 
 function shortSession(sessionId: string) {
