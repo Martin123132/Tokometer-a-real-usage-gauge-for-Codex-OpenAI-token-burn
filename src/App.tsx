@@ -1152,6 +1152,7 @@ function AccuracyPanel({
   const lastFiveConfidence = data?.windows.lastFiveHours.confidence
   const lastDayConfidence = data?.windows.lastDay.confidence
   const projectedConfidence = data?.rates.weeklyPercent.confidence
+  const parseFiles = data?.source.parseDiagnostics.files ?? []
 
   return (
     <section className="instrument-panel accuracy-panel">
@@ -1232,6 +1233,10 @@ function AccuracyPanel({
       <DetailsList title="Known" items={data?.accuracy.known ?? []} />
       <DetailsList title="Estimated" items={data?.accuracy.estimated ?? []} />
       <DetailsList title="Caveats" items={data?.accuracy.caveats ?? []} />
+      <DetailsList
+        title="Parse Files"
+        items={parseFiles.map(formatParseFileSummary)}
+      />
       <div className="path-note">
         <span>Codex home</span>
         <code>{data?.source.codexHome}</code>
@@ -1402,6 +1407,7 @@ function exportData(data: UsageData | null, format: 'json' | 'md') {
 }
 
 function createMarkdownReport(data: UsageData) {
+  const fileSummaries = data.source.parseDiagnostics.files.map(formatParseFileSummary)
   return [
     '# Tokometer Report',
     '',
@@ -1418,6 +1424,9 @@ function createMarkdownReport(data: UsageData) {
     `- Latest sample age: ${data.freshness.latestEventAgeMinutes ?? 0}m`,
     `- Parse lines: ${data.source.parseDiagnostics.parsedLines} parsed, ${data.source.parseDiagnostics.malformedLines} malformed, ${data.source.parseDiagnostics.parseFailures} parse failures`,
     `- Ignored samples: ${data.source.parseDiagnostics.ignoredEvents} (${data.source.parseDiagnostics.resetEvents} resets, ${data.source.parseDiagnostics.anomalousDeltas} anomalies)`,
+    '',
+    '## Parse File Summary',
+    ...fileSummaries.map((item) => `- ${item}`),
     '',
     '## Burn',
     '',
@@ -1525,6 +1534,27 @@ function shortSession(sessionId: string) {
     return sessionId.slice(0, 18)
   }
   return `${parts[0]} ${parts.at(-1)?.slice(0, 8)}`
+}
+
+function shortParsePath(filePath: string) {
+  const normalized = filePath.trim().replace(/\\/g, '/')
+  const parts = normalized.split('/').filter(Boolean)
+  if (parts.length <= 2) {
+    return filePath
+  }
+
+  return `${parts.at(-2)}/${parts.at(-1)}`
+}
+
+function formatParseFileSummary(file: ParseFileHealth) {
+  const ignored = file.tokenRecords - file.usedEvents
+  const malformed = file.malformedLines
+  const parseFailures = file.parseFailures
+  const quality = Math.round(
+    (file.usedEvents / Math.max(1, file.parsedLines)) * 100,
+  )
+
+  return `${shortParsePath(file.file)}: parsed ${file.parsedLines.toLocaleString()} lines, token records ${file.tokenRecords.toLocaleString()} (${quality}% kept), kept ${file.usedEvents.toLocaleString()}, ignored ${ignored.toLocaleString()}, fallback ${file.fallbackTokenSourceUsed.toLocaleString()}, malformed ${malformed.toLocaleString()}, parse failures ${parseFailures.toLocaleString()}`
 }
 
 function clamp(value: number) {
