@@ -1614,6 +1614,10 @@ function recommendAnomalyPolicy(
     return null
   }
 
+  if (data.freshness.staleMinutes !== null && data.freshness.staleMinutes >= 180) {
+    return null
+  }
+
   const diagnostics = data.source.parseDiagnostics
   const sampleCount = data.source.ignoredEvents + data.source.eventsFound
   const parsedLines = Math.max(1, diagnostics.parsedLines)
@@ -1626,11 +1630,26 @@ function recommendAnomalyPolicy(
     diagnostics.ignoredEvents / Math.max(1, sampleCount),
   )
 
-  if (sampleCount < 5 || diagnostics.parsedLines === 0) {
+  if (
+    sampleCount < 10 ||
+    diagnostics.parsedLines < 25 ||
+    data.windows.lastHour.eventCount + data.windows.lastFiveHours.eventCount < 5
+  ) {
     return null
   }
 
-  if (ignoredRatio >= 0.35 || parseIssueRatio >= 0.25) {
+  const lastHourCoverage = data.windows.lastHour.coveragePercent
+  const fiveHourCoverage = data.windows.lastFiveHours.coveragePercent
+  const dayCoverage = data.windows.lastDay.coveragePercent
+  const isCoverageSparse =
+    lastHourCoverage < 20 || fiveHourCoverage < 30 || dayCoverage < 20
+  const isSignalWeak =
+    data.rates.lastHourRateConfidence.level === 'low' ||
+    data.rates.lastFiveHoursRateConfidence.level === 'low' ||
+    data.rates.lastDayRateConfidence.level === 'low'
+  const isFreshEnough = (data.freshness.latestEventAgeMinutes ?? 0) <= 90
+
+  if (ignoredRatio >= 0.22 || parseIssueRatio >= 0.18 || isSignalWeak || isCoverageSparse) {
     return {
       policy: 'strict',
       reason: 'Recent samples contain noisy drops or malformed data, so filtering should be stricter.',
@@ -1640,10 +1659,15 @@ function recommendAnomalyPolicy(
   }
 
   if (
-    ignoredRatio <= 0.08 &&
-    parseIssueRatio <= 0.04 &&
+    ignoredRatio <= 0.05 &&
+    parseIssueRatio <= 0.02 &&
     data.source.ignoredEvents === 0 &&
-    data.rates.lastHourRateConfidence?.level === 'high'
+    isFreshEnough &&
+    lastHourCoverage >= 85 &&
+    fiveHourCoverage >= 60 &&
+    dayCoverage >= 40 &&
+    data.rates.lastHourRateConfidence.level === 'high' &&
+    data.rates.lastFiveHoursRateConfidence.level === 'high'
   ) {
     return {
       policy: 'relaxed',
