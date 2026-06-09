@@ -183,4 +183,4 @@ Tokometer is local-first. It does not send your Codex logs anywhere. The dashboa
 
 ## License
 
-MIT
+PolyForm Noncommercial License 1.0.0. Commercial use requires a separate written license.
