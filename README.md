@@ -4,6 +4,14 @@ A real local usage gauge for Codex token burn.
 
 Tokometer reads local Codex `token_count` metadata and turns it into an instrument-cluster dashboard: weekly usage, 5-hour window, burn rate, cached vs active tokens, history, alerts, reports, and heaviest sessions.
 
+It also includes production-readiness surfaces for local installs:
+
+- System Check setup doctor
+- Safe diagnostics bundle export
+- Local app-meter calibration logbook
+- Parser regression fixtures and smoke scenarios
+- GitHub Actions CI and packaging workflows
+
 ## Screenshots
 
 ![Tokometer dashboard with 5h app meter override](docs/images/tokometer-dashboard.png)
@@ -92,6 +100,11 @@ The Settings view stores local UI preferences in browser/Electron local storage:
 - 5h and weekly app meter overrides
 - Parser anomaly policy (`strict`, `normal`, `relaxed`)
 
+Settings also includes:
+
+- **System Check**: verifies local log discovery, token events, history writes, parser quality, freshness, rate confidence, and app-meter calibration.
+- **Calibration Logbook**: records visible 5h/weekly app meter samples and their delta from local metadata.
+
 Runtime paths are still process-level settings. Set `TOKEN_GAUGE_CODEX_HOME` or `TOKEN_GAUGE_DATA_DIR` before starting Tokometer when you need to scan or store data somewhere else.
 
 ## Portable Paths
@@ -133,10 +146,11 @@ Important caveat: the visible ChatGPT/Codex app meter can include activity Tokom
 
 ## Exports
 
-Use the `JSON` and `Report` buttons in the dashboard to export:
+Use the dashboard export buttons to export:
 
 - Raw usage summary JSON
 - Markdown report with current limits, burn, alerts, and caveats
+- Redacted diagnostics JSON with settings, confidence, parser health, calibration samples, and no raw JSONL content
 
 ## Release Builds
 
@@ -150,6 +164,8 @@ npm run dist
 
 Artifacts are written to `release/`.
 
+CI is defined in `.github/workflows/ci.yml` and runs lint, tests, build, and smoke scenarios on pushes and pull requests to `main`.
+
 ## Development Notes
 
 The parser lives in:
@@ -162,6 +178,12 @@ Tests live in:
 
 ```text
 server/usage.test.ts
+```
+
+Parser regression fixtures live in:
+
+```text
+server/fixtures
 ```
 
 The Vite dev server exposes:

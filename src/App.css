@@ -121,6 +121,12 @@
   border: 1px solid rgba(255, 210, 138, 0.32);
 }
 
+.status-pill.danger {
+  color: #ffd0d0;
+  background: rgba(255, 77, 77, 0.12);
+  border: 1px solid rgba(255, 77, 77, 0.34);
+}
+
 .status-pill.estimated {
   color: #ffd28a;
   background: rgba(255, 179, 63, 0.11);
@@ -184,6 +190,11 @@ button:hover {
   border-color: rgba(55, 214, 255, 0.74);
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
+}
+
 .inline-error {
   margin-bottom: 18px;
   padding: 12px 14px;
@@ -209,7 +220,7 @@ button:hover {
 
 .insight-grid {
   display: grid;
-  grid-template-columns: minmax(280px, 0.85fr) minmax(320px, 1fr) minmax(360px, 1.2fr);
+  grid-template-columns: minmax(260px, 0.8fr) minmax(300px, 0.9fr) minmax(300px, 0.95fr) minmax(360px, 1.2fr);
   gap: 18px;
   margin-bottom: 18px;
 }
@@ -510,7 +521,7 @@ button:hover {
   text-transform: uppercase;
 }
 
-.settings-field div {
+.settings-field > div:not(.calibration-control) {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
@@ -589,6 +600,75 @@ button:hover {
 
 .release-line strong {
   color: #f4f8fb;
+}
+
+.check-stack,
+.calibration-history-list {
+  display: grid;
+  gap: 10px;
+}
+
+.check-row,
+.calibration-history-row {
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid rgba(143, 162, 179, 0.13);
+  border-left-width: 4px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.check-row {
+  display: grid;
+  gap: 5px;
+}
+
+.check-row.pass {
+  border-left-color: #37d6ff;
+}
+
+.check-row.warn {
+  border-left-color: #ffb33f;
+}
+
+.check-row.fail {
+  border-left-color: #ff4d4d;
+}
+
+.check-row strong,
+.calibration-history-row strong {
+  color: #f4f8fb;
+  font-size: 14px;
+}
+
+.check-row span,
+.calibration-history-row span,
+.calibration-history-row em {
+  color: #a8b8c6;
+  font-size: 13px;
+  font-style: normal;
+  line-height: 1.35;
+}
+
+.calibration-history-row {
+  display: grid;
+  grid-template-columns: minmax(54px, 0.45fr) minmax(118px, 0.8fr) minmax(0, 1.4fr) auto;
+  align-items: center;
+  gap: 10px;
+  border-left-color: #37d6ff;
+}
+
+.calibration-history-row b {
+  color: #ffd28a;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.empty-note {
+  margin: 0;
+  color: #a8b8c6;
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .panel-heading {
@@ -1074,6 +1154,10 @@ tbody tr:hover {
   }
 
   .sample-confidence-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .calibration-history-row {
     grid-template-columns: 1fr;
   }
 }

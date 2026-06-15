@@ -55,6 +55,7 @@ type DataConfidence = {
 type ParseFileHealth = {
   file: string
   parsedLines: number
+  nonTokenLines: number
   malformedLines: number
   parseFailures: number
   tokenRecords: number
@@ -64,6 +65,7 @@ type ParseFileHealth = {
 
 type ParseDiagnostics = {
   parsedLines: number
+  nonTokenLines: number
   malformedLines: number
   parseFailures: number
   tokenRecords: number
@@ -398,6 +400,7 @@ async function parseTokenEvents(
   const diagnostics: ParseFileHealth = {
     file: filePath,
     parsedLines: 0,
+    nonTokenLines: 0,
     malformedLines: 0,
     parseFailures: 0,
     tokenRecords: 0,
@@ -414,7 +417,7 @@ async function parseTokenEvents(
     diagnostics.parsedLines += 1
 
     if (!line.includes('"token_count"')) {
-      diagnostics.malformedLines += 1
+      diagnostics.nonTokenLines += 1
       continue
     }
 
@@ -495,6 +498,7 @@ function aggregateParseDiagnostics(
 
   return {
     parsedLines: files.reduce((sum, file) => sum + file.parsedLines, 0),
+    nonTokenLines: files.reduce((sum, file) => sum + file.nonTokenLines, 0),
     malformedLines: files.reduce((sum, file) => sum + file.malformedLines, 0),
     parseFailures: files.reduce((sum, file) => sum + file.parseFailures, 0),
     tokenRecords: files.reduce((sum, file) => sum + file.tokenRecords, 0),

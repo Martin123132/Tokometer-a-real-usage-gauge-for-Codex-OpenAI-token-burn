@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -646,6 +646,35 @@ describe('usage parser', () => {
     expect(summary.source.ignoredEvents).toBe(1)
     expect(summary.source.eventsFound).toBe(5)
     expect(summary.windows.lastHour.totalTokens).toBe(50_000)
+  })
+
+  it('parses the schema-drift regression fixture safely', async () => {
+    const fixtureText = await readFile(
+      new URL('./fixtures/schema-drift.jsonl', import.meta.url),
+      'utf8',
+    )
+    const { codexHome, dataDir } = await createFixture(
+      fixtureText.split(/\r?\n/).filter(Boolean),
+    )
+
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.source.parseDiagnostics.parsedLines).toBe(6)
+    expect(summary.source.parseDiagnostics.nonTokenLines).toBe(1)
+    expect(summary.source.parseDiagnostics.malformedLines).toBe(0)
+    expect(summary.source.parseDiagnostics.parseFailures).toBe(1)
+    expect(summary.source.parseDiagnostics.fallbackTokenSourceUsed).toBe(1)
+    expect(summary.source.parseDiagnostics.resetEvents).toBe(1)
+    expect(summary.source.eventsFound).toBe(2)
+    expect(summary.source.ignoredEvents).toBe(1)
+    expect(summary.windows.lastHour.totalTokens).toBe(280)
+    expect(summary.limits.secondary.usedPercent).toBe(52)
   })
 })
 

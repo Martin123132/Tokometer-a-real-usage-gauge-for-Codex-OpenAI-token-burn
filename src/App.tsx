@@ -10,6 +10,25 @@ type AnomalyPolicyRecommendation = {
   parseIssueRatio: number
 }
 
+type SystemCheckStatus = 'pass' | 'warn' | 'fail'
+
+type SystemCheck = {
+  id: string
+  label: string
+  status: SystemCheckStatus
+  detail: string
+}
+
+type CalibrationEntry = {
+  id: string
+  timestamp: string
+  meter: 'primary' | 'weekly'
+  visiblePercent: number
+  metadataPercent: number | null
+  deltaPoints: number | null
+  generatedAt: string | null
+}
+
 type TokenTotals = {
   inputTokens: number
   cachedInputTokens: number
@@ -30,6 +49,7 @@ type DataConfidence = {
 type ParseFileHealth = {
   file: string
   parsedLines: number
+  nonTokenLines: number
   malformedLines: number
   parseFailures: number
   tokenRecords: number
@@ -39,6 +59,7 @@ type ParseFileHealth = {
 
 type ParseDiagnostics = {
   parsedLines: number
+  nonTokenLines: number
   malformedLines: number
   parseFailures: number
   tokenRecords: number
@@ -194,6 +215,8 @@ const primaryMeterStorageKey = 'tokometer-primary-meter'
 const legacyPrimaryMeterStorageKey = 'token-gauge-primary-meter'
 const weeklyMeterStorageKey = 'tokometer-weekly-meter'
 const legacyWeeklyMeterStorageKey = 'token-gauge-meter'
+const calibrationHistoryStorageKey = 'tokometer-calibration-history-v1'
+const calibrationHistoryLimit = 80
 
 function App() {
   const [data, setData] = useState<UsageData | null>(null)
@@ -215,6 +238,7 @@ function App() {
       ''
     )
   })
+  const [calibrationHistory, setCalibrationHistory] = useState(loadCalibrationHistory)
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -287,6 +311,17 @@ function App() {
     () => recommendAnomalyPolicy(data),
     [data],
   )
+  const systemChecks = useMemo(
+    () =>
+      buildSystemChecks(
+        data,
+        settings,
+        primaryMeterOverride,
+        meterOverride,
+      ),
+    [data, settings, primaryMeterOverride, meterOverride],
+  )
+  const systemHealth = summarizeSystemChecks(systemChecks)
 
   const qualityNotes = useMemo(() => {
     const items: string[] = []
@@ -326,6 +361,7 @@ function App() {
     } else {
       window.localStorage.setItem(primaryMeterStorageKey, nextValue)
       window.localStorage.removeItem(legacyPrimaryMeterStorageKey)
+      recordCalibrationSample('primary', nextValue)
     }
   }
 
@@ -337,6 +373,7 @@ function App() {
     } else {
       window.localStorage.setItem(weeklyMeterStorageKey, nextValue)
       window.localStorage.removeItem(legacyWeeklyMeterStorageKey)
+      recordCalibrationSample('weekly', nextValue)
     }
   }
 
@@ -345,8 +382,45 @@ function App() {
     setWeeklyMeterValue('')
   }
 
+  const clearCalibrationHistory = () => {
+    setCalibrationHistory([])
+    window.localStorage.removeItem(calibrationHistoryStorageKey)
+  }
+
   const resetSettings = () => {
     setSettings(defaultSettings)
+  }
+
+  const recordCalibrationSample = (meter: CalibrationEntry['meter'], value: string) => {
+    const visiblePercent = Number(value)
+    if (!Number.isFinite(visiblePercent)) {
+      return
+    }
+
+    const metadataPercent =
+      meter === 'primary'
+        ? data?.limits.primary.usedPercent ?? null
+        : data?.limits.secondary.usedPercent ?? null
+    const deltaPoints =
+      metadataPercent === null ? null : clamp(visiblePercent) - metadataPercent
+    const entry: CalibrationEntry = {
+      id: `${meter}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: new Date().toISOString(),
+      meter,
+      visiblePercent: clamp(visiblePercent),
+      metadataPercent,
+      deltaPoints,
+      generatedAt: data?.source.generatedAt ?? null,
+    }
+
+    setCalibrationHistory((previous) => {
+      const next = [entry, ...previous].slice(0, calibrationHistoryLimit)
+      window.localStorage.setItem(
+        calibrationHistoryStorageKey,
+        JSON.stringify(next),
+      )
+      return next
+    })
   }
 
   if (!data && loading) {
@@ -390,6 +464,10 @@ function App() {
             <h1>Tokometer</h1>
         <div className="meta-row">
               <StatusPill tone="known" label="Known Metadata" />
+              <StatusPill
+                tone={systemHealth.tone}
+                label={systemHealth.label}
+              />
               {hasSampleWarning ? (
                 <StatusPill tone="warning" label="Sample Warning" />
               ) : null}
@@ -413,6 +491,21 @@ function App() {
             <button type="button" onClick={() => exportData(data, 'md')}>
               Report
             </button>
+            <button
+              type="button"
+              onClick={() =>
+                exportDiagnosticsBundle(
+                  data,
+                  settings,
+                  primaryMeterOverride,
+                  meterOverride,
+                  systemChecks,
+                  calibrationHistory,
+                )
+              }
+            >
+              Diagnostics
+            </button>
           </div>
         </header>
 
@@ -435,12 +528,15 @@ function App() {
             onApplyRecommendedPolicy={(policy) =>
               setSettings((previous) => ({ ...previous, anomalyPolicy: policy }))
             }
+            systemChecks={systemChecks}
+            calibrationHistory={calibrationHistory}
             primaryMeterOverride={primaryMeterOverride}
             weeklyMeterOverride={meterOverride}
             onPrimaryMeterChange={setPrimaryMeterValue}
             onWeeklyMeterChange={setWeeklyMeterValue}
             onResetMeters={resetMeterOverrides}
             onResetSettings={resetSettings}
+            onClearCalibrationHistory={clearCalibrationHistory}
           />
         ) : (
           <>
@@ -538,6 +634,7 @@ function App() {
         <section className="insight-grid">
           <AlertsPanel alerts={alerts} />
           <HistoryPanel samples={data?.history.samples ?? []} />
+          <SystemCheckPanel checks={systemChecks} compact />
           <AccuracyPanel
             data={data}
             visibleMeter={visibleMeter}
@@ -603,24 +700,30 @@ function SettingsView({
   onSettingsChange,
   anomalyPolicyRecommendation,
   onApplyRecommendedPolicy,
+  systemChecks,
+  calibrationHistory,
   primaryMeterOverride,
   weeklyMeterOverride,
   onPrimaryMeterChange,
   onWeeklyMeterChange,
   onResetMeters,
   onResetSettings,
+  onClearCalibrationHistory,
 }: {
   data: UsageData | null
   settings: AppSettings
   onSettingsChange: (settings: AppSettings) => void
   anomalyPolicyRecommendation: AnomalyPolicyRecommendation | null
   onApplyRecommendedPolicy: (policy: AnomalyPolicy) => void
+  systemChecks: SystemCheck[]
+  calibrationHistory: CalibrationEntry[]
   primaryMeterOverride: string
   weeklyMeterOverride: string
   onPrimaryMeterChange: (value: string) => void
   onWeeklyMeterChange: (value: string) => void
   onResetMeters: () => void
   onResetSettings: () => void
+  onClearCalibrationHistory: () => void
 }) {
   const primaryPercent = data?.limits.primary.usedPercent ?? 0
   const weeklyPercent = data?.limits.secondary.usedPercent ?? 0
@@ -700,6 +803,8 @@ function SettingsView({
         </div>
       </section>
 
+      <SystemCheckPanel checks={systemChecks} />
+
       <section className="instrument-panel settings-panel meter-settings-panel">
         <div className="panel-heading">
           <h2>App Meters</h2>
@@ -729,6 +834,11 @@ function SettingsView({
           </button>
         </div>
       </section>
+
+      <CalibrationHistoryPanel
+        entries={calibrationHistory}
+        onClear={onClearCalibrationHistory}
+      />
 
       <section className="instrument-panel settings-panel settings-wide">
         <div className="panel-heading">
@@ -911,12 +1021,93 @@ function ReleaseLine({ label, value }: { label: string; value: string }) {
   )
 }
 
+function SystemCheckPanel({
+  checks,
+  compact = false,
+}: {
+  checks: SystemCheck[]
+  compact?: boolean
+}) {
+  const visibleChecks = compact ? checks.slice(0, 5) : checks
+  const summary = summarizeSystemChecks(checks)
+
+  return (
+    <section className="instrument-panel settings-panel system-check-panel">
+      <div className="panel-heading">
+        <h2>System Check</h2>
+        <StatusPill tone={summary.tone} label={summary.label} />
+      </div>
+      <div className="check-stack">
+        {visibleChecks.map((check) => (
+          <div className={`check-row ${check.status}`} key={check.id}>
+            <strong>{check.label}</strong>
+            <span>{check.detail}</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function CalibrationHistoryPanel({
+  entries,
+  onClear,
+}: {
+  entries: CalibrationEntry[]
+  onClear: () => void
+}) {
+  const recentEntries = entries.slice(0, 8)
+
+  return (
+    <section className="instrument-panel settings-panel calibration-history-panel">
+      <div className="panel-heading">
+        <h2>Calibration Logbook</h2>
+        <span>{entries.length} samples</span>
+      </div>
+      {recentEntries.length > 0 ? (
+        <div className="calibration-history-list">
+          {recentEntries.map((entry) => (
+            <div className="calibration-history-row" key={entry.id}>
+              <strong>{entry.meter === 'primary' ? '5h' : 'Weekly'}</strong>
+              <span>{formatDateTime(entry.timestamp)}</span>
+              <em>
+                Visible {Math.round(entry.visiblePercent)}%
+                {entry.metadataPercent === null
+                  ? ' / metadata unknown'
+                  : ` / metadata ${Math.round(entry.metadataPercent)}%`}
+              </em>
+              <b>
+                {entry.deltaPoints === null
+                  ? 'No delta'
+                  : `${entry.deltaPoints >= 0 ? '+' : ''}${entry.deltaPoints.toFixed(0)} pts`}
+              </b>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="empty-note">
+          Enter a visible 5h or weekly app meter value to start calibration history.
+        </p>
+      )}
+      <div className="settings-actions">
+        <button
+          type="button"
+          onClick={onClear}
+          disabled={entries.length === 0}
+        >
+          Clear Logbook
+        </button>
+      </div>
+    </section>
+  )
+}
+
 function StatusPill({
   label,
   tone,
 }: {
   label: string
-  tone: 'known' | 'estimated' | 'warning'
+  tone: 'known' | 'estimated' | 'warning' | 'danger'
 }) {
   return <span className={`status-pill ${tone}`}>{label}</span>
 }
@@ -1282,7 +1473,7 @@ function AccuracyPanel({
           <ConfidenceTile
             label="Parse quality"
             value={`${parseDiagnostics?.parsedLines?.toLocaleString() ?? 0} lines`}
-            detail={`${parseDiagnostics?.usedEvents?.toLocaleString() ?? 0} events kept, ${parseDiagnostics?.ignoredEvents?.toLocaleString() ?? 0} skipped`}
+            detail={`${parseDiagnostics?.usedEvents?.toLocaleString() ?? 0} events kept, ${parseDiagnostics?.nonTokenLines?.toLocaleString() ?? 0} non-token lines ignored`}
             footer={`Fallback totals: ${parseDiagnostics?.fallbackTokenSourceUsed?.toLocaleString() ?? 0}`}
           />
         </div>
@@ -1477,6 +1668,112 @@ function exportData(data: UsageData | null, format: 'json' | 'md') {
   )
 }
 
+function exportDiagnosticsBundle(
+  data: UsageData | null,
+  settings: AppSettings,
+  primaryMeterOverride: string,
+  weeklyMeterOverride: string,
+  systemChecks: SystemCheck[],
+  calibrationHistory: CalibrationEntry[],
+) {
+  if (!data) {
+    return
+  }
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+  downloadFile(
+    `tokometer-diagnostics-${timestamp}.json`,
+    JSON.stringify(
+      createDiagnosticsBundle(
+        data,
+        settings,
+        primaryMeterOverride,
+        weeklyMeterOverride,
+        systemChecks,
+        calibrationHistory,
+      ),
+      null,
+      2,
+    ),
+    'application/json',
+  )
+}
+
+function createDiagnosticsBundle(
+  data: UsageData,
+  settings: AppSettings,
+  primaryMeterOverride: string,
+  weeklyMeterOverride: string,
+  systemChecks: SystemCheck[],
+  calibrationHistory: CalibrationEntry[],
+) {
+  return {
+    schema: 'tokometer-diagnostics-v1',
+    exportedAt: new Date().toISOString(),
+    privacy:
+      'This bundle excludes raw JSONL log lines and full session identifiers.',
+    app: {
+      name: 'Tokometer',
+      version: '0.1.0',
+      userAgent: window.navigator.userAgent,
+    },
+    settings,
+    meterOverrides: {
+      primary:
+        primaryMeterOverride === '' ? null : clamp(Number(primaryMeterOverride)),
+      weekly:
+        weeklyMeterOverride === '' ? null : clamp(Number(weeklyMeterOverride)),
+    },
+    source: {
+      codexHome: redactPath(data.source.codexHome),
+      dataDir: redactPath(data.source.dataDir),
+      filesScanned: data.source.filesScanned,
+      eventsFound: data.source.eventsFound,
+      sessionsFound: data.source.sessionsFound,
+      rawTokenRecords: data.source.rawTokenRecords,
+      ignoredEvents: data.source.ignoredEvents,
+      generatedAt: data.source.generatedAt,
+    },
+    limits: data.limits,
+    windows: {
+      lastHour: summarizeWindowForDiagnostics(data.windows.lastHour),
+      lastFiveHours: summarizeWindowForDiagnostics(data.windows.lastFiveHours),
+      lastDay: summarizeWindowForDiagnostics(data.windows.lastDay),
+      observedAll: summarizeWindowForDiagnostics(data.windows.observedAll),
+    },
+    rates: data.rates,
+    freshness: data.freshness,
+    parseDiagnostics: {
+      ...data.source.parseDiagnostics,
+      files: data.source.parseDiagnostics.files.map((file, index) => ({
+        file: `file-${index + 1}.jsonl`,
+        parsedLines: file.parsedLines,
+        nonTokenLines: file.nonTokenLines,
+        malformedLines: file.malformedLines,
+        parseFailures: file.parseFailures,
+        tokenRecords: file.tokenRecords,
+        usedEvents: file.usedEvents,
+        fallbackTokenSourceUsed: file.fallbackTokenSourceUsed,
+      })),
+    },
+    systemChecks,
+    calibrationHistory: calibrationHistory.slice(0, 30),
+    alerts: data.alerts,
+    accuracy: data.accuracy,
+  }
+}
+
+function summarizeWindowForDiagnostics(window: WindowSummary) {
+  return {
+    totalTokens: window.totalTokens,
+    activeTokens: window.activeTokens,
+    eventCount: window.eventCount,
+    observedMinutes: window.observedMinutes,
+    coveragePercent: window.coveragePercent,
+    confidence: window.confidence,
+  }
+}
+
 function createMarkdownReport(data: UsageData) {
   const fileSummaries = data.source.parseDiagnostics.files.map(formatParseFileSummary)
   return [
@@ -1493,7 +1790,7 @@ function createMarkdownReport(data: UsageData) {
     `- Projection: ${formatProjection(data)}`,
     `- Weekly trend confidence: ${data.rates.weeklyPercent.confidence.level} (${(data.rates.weeklyPercent.confidence.score * 100).toFixed(0)}%) - ${data.rates.weeklyPercent.confidence.reason}`,
     `- Latest sample age: ${data.freshness.latestEventAgeMinutes ?? 0}m`,
-    `- Parse lines: ${data.source.parseDiagnostics.parsedLines} parsed, ${data.source.parseDiagnostics.malformedLines} malformed, ${data.source.parseDiagnostics.parseFailures} parse failures`,
+    `- Parse lines: ${data.source.parseDiagnostics.parsedLines} parsed, ${data.source.parseDiagnostics.nonTokenLines} non-token, ${data.source.parseDiagnostics.malformedLines} malformed, ${data.source.parseDiagnostics.parseFailures} parse failures`,
     `- Ignored samples: ${data.source.parseDiagnostics.ignoredEvents} (${data.source.parseDiagnostics.resetEvents} resets, ${data.source.parseDiagnostics.anomalousDeltas} anomalies)`,
     '',
     '## Parse File Summary',
@@ -1562,6 +1859,19 @@ function formatDate(value?: string | null) {
   }).format(new Date(value))
 }
 
+function formatDateTime(value?: string | null) {
+  if (!value) {
+    return 'Never'
+  }
+
+  return new Intl.DateTimeFormat([], {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date(value))
+}
+
 function formatTime(value?: string | null) {
   if (!value) {
     return 'Never'
@@ -1620,10 +1930,16 @@ function recommendAnomalyPolicy(
 
   const diagnostics = data.source.parseDiagnostics
   const sampleCount = data.source.ignoredEvents + data.source.eventsFound
-  const parsedLines = Math.max(1, diagnostics.parsedLines)
+  const tokenCandidateLines = Math.max(
+    1,
+    diagnostics.tokenRecords +
+      diagnostics.malformedLines +
+      diagnostics.parseFailures,
+  )
   const parseIssueRatio = Math.min(
     1,
-    (diagnostics.malformedLines + diagnostics.parseFailures) / parsedLines,
+    (diagnostics.malformedLines + diagnostics.parseFailures) /
+      tokenCandidateLines,
   )
   const ignoredRatio = Math.min(
     1,
@@ -1632,7 +1948,7 @@ function recommendAnomalyPolicy(
 
   if (
     sampleCount < 10 ||
-    diagnostics.parsedLines < 25 ||
+    diagnostics.tokenRecords < 10 ||
     data.windows.lastHour.eventCount + data.windows.lastFiveHours.eventCount < 5
   ) {
     return null
@@ -1687,6 +2003,135 @@ function recommendAnomalyPolicy(
   }
 }
 
+function buildSystemChecks(
+  data: UsageData | null,
+  settings: AppSettings,
+  primaryMeterOverride: string,
+  weeklyMeterOverride: string,
+): SystemCheck[] {
+  if (!data) {
+    return [
+      {
+        id: 'usage-payload',
+        label: 'Usage API',
+        status: 'fail',
+        detail: 'No usage payload has loaded yet.',
+      },
+    ]
+  }
+
+  const parseDiagnostics = data.source.parseDiagnostics
+  const tokenCandidateLines = Math.max(
+    1,
+    parseDiagnostics.tokenRecords +
+      parseDiagnostics.malformedLines +
+      parseDiagnostics.parseFailures,
+  )
+  const parseIssueRatio =
+    (parseDiagnostics.malformedLines + parseDiagnostics.parseFailures) /
+    tokenCandidateLines
+  const ignoredRatio =
+    data.source.ignoredEvents /
+    Math.max(1, data.source.eventsFound + data.source.ignoredEvents)
+  const latestAge = data.freshness.latestEventAgeMinutes
+  const hasBothOverrides =
+    primaryMeterOverride.trim() !== '' && weeklyMeterOverride.trim() !== ''
+
+  return [
+    {
+      id: 'codex-log-path',
+      label: 'Codex log path',
+      status: data.source.filesScanned > 0 ? 'pass' : 'fail',
+      detail:
+        data.source.filesScanned > 0
+          ? `${data.source.filesScanned} JSONL files scanned.`
+          : `No JSONL files found under ${data.source.codexHome}.`,
+    },
+    {
+      id: 'token-events',
+      label: 'Token events',
+      status:
+        data.source.eventsFound > 0
+          ? 'pass'
+          : data.source.rawTokenRecords > 0
+            ? 'warn'
+            : 'fail',
+      detail:
+        data.source.eventsFound > 0
+          ? `${data.source.eventsFound.toLocaleString()} usable local deltas from ${data.source.rawTokenRecords.toLocaleString()} token records.`
+          : 'No usable token deltas are available yet.',
+    },
+    {
+      id: 'history-store',
+      label: 'History store',
+      status: data.history.latest ? 'pass' : 'warn',
+      detail: data.history.latest
+        ? `${data.history.samples.length.toLocaleString()} local snapshots retained.`
+        : `No history sample written yet in ${data.source.dataDir}.`,
+    },
+    {
+      id: 'parser-quality',
+      label: 'Parser quality',
+      status:
+        parseIssueRatio >= 0.15 || ignoredRatio >= 0.25
+          ? 'fail'
+          : parseIssueRatio >= 0.04 || ignoredRatio >= 0.12
+            ? 'warn'
+            : 'pass',
+      detail: `${Math.round(parseIssueRatio * 100)}% parse issues, ${Math.round(
+        ignoredRatio * 100,
+      )}% ignored/reset/anomaly samples.`,
+    },
+    {
+      id: 'freshness',
+      label: 'Freshness',
+      status:
+        latestAge === null
+          ? 'fail'
+          : latestAge > 240
+            ? 'fail'
+            : latestAge > Math.max(120, settings.refreshSeconds * 3 / 60)
+              ? 'warn'
+              : 'pass',
+      detail:
+        latestAge === null
+          ? 'No token event timestamp found.'
+          : `Latest token event was ${Math.round(latestAge)} minutes ago.`,
+    },
+    {
+      id: 'rate-confidence',
+      label: 'Rate confidence',
+      status:
+        data.rates.lastHourRateConfidence.level === 'low' &&
+        data.rates.lastFiveHoursRateConfidence.level === 'low'
+          ? 'warn'
+          : 'pass',
+      detail: `Last hour ${data.rates.lastHourRateConfidence.level}; 5h ${data.rates.lastFiveHoursRateConfidence.level}.`,
+    },
+    {
+      id: 'visible-meter-calibration',
+      label: 'App meter calibration',
+      status: hasBothOverrides ? 'pass' : 'warn',
+      detail: hasBothOverrides
+        ? 'Both visible app meter overrides are set for mismatch tracking.'
+        : 'Set visible 5h and weekly app meters to track local-vs-app drift.',
+    },
+  ]
+}
+
+function summarizeSystemChecks(checks: SystemCheck[]): {
+  label: string
+  tone: 'known' | 'warning' | 'danger'
+} {
+  if (checks.some((check) => check.status === 'fail')) {
+    return { label: 'Needs Setup', tone: 'danger' }
+  }
+  if (checks.some((check) => check.status === 'warn')) {
+    return { label: 'Needs Review', tone: 'warning' }
+  }
+  return { label: 'Ready', tone: 'known' }
+}
+
 function shortSession(sessionId: string) {
   const parts = sessionId.split('-')
   if (parts.length < 5) {
@@ -1705,15 +2150,24 @@ function shortParsePath(filePath: string) {
   return `${parts.at(-2)}/${parts.at(-1)}`
 }
 
+function redactPath(filePath: string) {
+  const normalized = filePath.replace(/\\/g, '/')
+  const homeLike = normalized.match(/^([A-Z]:)?\/Users\/([^/]+)/i)
+  if (homeLike) {
+    return normalized.replace(homeLike[0], `${homeLike[1] ?? ''}/Users/<user>`)
+  }
+  return normalized.replace(/^\/home\/[^/]+/i, '/home/<user>')
+}
+
 function formatParseFileSummary(file: ParseFileHealth) {
   const ignored = file.tokenRecords - file.usedEvents
   const malformed = file.malformedLines
   const parseFailures = file.parseFailures
   const quality = Math.round(
-    (file.usedEvents / Math.max(1, file.parsedLines)) * 100,
+    (file.usedEvents / Math.max(1, file.tokenRecords)) * 100,
   )
 
-  return `${shortParsePath(file.file)}: parsed ${file.parsedLines.toLocaleString()} lines, token records ${file.tokenRecords.toLocaleString()} (${quality}% kept), kept ${file.usedEvents.toLocaleString()}, ignored ${ignored.toLocaleString()}, fallback ${file.fallbackTokenSourceUsed.toLocaleString()}, malformed ${malformed.toLocaleString()}, parse failures ${parseFailures.toLocaleString()}`
+  return `${shortParsePath(file.file)}: parsed ${file.parsedLines.toLocaleString()} lines, non-token ${file.nonTokenLines.toLocaleString()}, token records ${file.tokenRecords.toLocaleString()} (${quality}% kept), kept ${file.usedEvents.toLocaleString()}, ignored ${ignored.toLocaleString()}, fallback ${file.fallbackTokenSourceUsed.toLocaleString()}, malformed ${malformed.toLocaleString()}, parse failures ${parseFailures.toLocaleString()}`
 }
 
 function clamp(value: number) {
@@ -1781,6 +2235,61 @@ function loadSettings(): AppSettings {
     }
   } catch {
     return defaultSettings
+  }
+}
+
+function loadCalibrationHistory(): CalibrationEntry[] {
+  const storedHistory = window.localStorage.getItem(calibrationHistoryStorageKey)
+  if (!storedHistory) {
+    return []
+  }
+
+  try {
+    const parsed = JSON.parse(storedHistory)
+    if (!Array.isArray(parsed)) {
+      return []
+    }
+
+    return parsed
+      .flatMap((entry): CalibrationEntry[] => {
+        if (!entry || typeof entry !== 'object') {
+          return []
+        }
+
+        const candidate = entry as Partial<CalibrationEntry>
+        if (
+          typeof candidate.id !== 'string' ||
+          typeof candidate.timestamp !== 'string' ||
+          (candidate.meter !== 'primary' && candidate.meter !== 'weekly') ||
+          typeof candidate.visiblePercent !== 'number'
+        ) {
+          return []
+        }
+
+        return [
+          {
+            id: candidate.id,
+            timestamp: candidate.timestamp,
+            meter: candidate.meter,
+            visiblePercent: clamp(candidate.visiblePercent),
+            metadataPercent:
+              typeof candidate.metadataPercent === 'number'
+                ? candidate.metadataPercent
+                : null,
+            deltaPoints:
+              typeof candidate.deltaPoints === 'number'
+                ? candidate.deltaPoints
+                : null,
+            generatedAt:
+              typeof candidate.generatedAt === 'string'
+                ? candidate.generatedAt
+                : null,
+          },
+        ]
+      })
+      .slice(0, calibrationHistoryLimit)
+  } catch {
+    return []
   }
 }
 
