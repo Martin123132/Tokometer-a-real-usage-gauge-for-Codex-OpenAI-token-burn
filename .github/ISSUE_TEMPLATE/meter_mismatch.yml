@@ -1,0 +1,54 @@
+name: Meter mismatch report
+description: Report a difference between the visible app meter and Tokometer metadata.
+title: "[Meter mismatch]: "
+labels: ["calibration", "accuracy"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This report is for cases where the visible Codex/OpenAI app meter differs from Tokometer. Please do not share screenshots with private conversation content.
+  - type: input
+    id: visible_5h
+    attributes:
+      label: Visible 5h meter
+      placeholder: "Example: 90%"
+    validations:
+      required: true
+  - type: input
+    id: tokometer_5h
+    attributes:
+      label: Tokometer 5h metadata
+      placeholder: "Example: 8%"
+    validations:
+      required: true
+  - type: input
+    id: visible_weekly
+    attributes:
+      label: Visible weekly meter
+      placeholder: "Example: 55%"
+    validations:
+      required: false
+  - type: input
+    id: tokometer_weekly
+    attributes:
+      label: Tokometer weekly metadata
+      placeholder: "Example: 52%"
+    validations:
+      required: false
+  - type: input
+    id: recorded_at
+    attributes:
+      label: Time recorded
+      placeholder: "2026-06-18 14:30 Europe/London"
+    validations:
+      required: true
+  - type: textarea
+    id: calibration
+    attributes:
+      label: Calibration details
+      description: Include calibration insight sample count, mean delta, latest delta, and confidence if available.
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics bundle
+      description: Attach the redacted diagnostics JSON or paste the preview summary.

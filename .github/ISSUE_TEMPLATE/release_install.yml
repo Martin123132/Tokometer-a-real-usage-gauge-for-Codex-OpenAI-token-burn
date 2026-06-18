@@ -1,0 +1,48 @@
+name: Release or install problem
+description: Report installer, portable app, checksum, or launch problems.
+title: "[Release]: "
+labels: ["release", "install"]
+body:
+  - type: dropdown
+    id: artifact
+    attributes:
+      label: Artifact
+      options:
+        - Windows installer
+        - Windows portable
+        - Source checkout
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or tag
+      placeholder: "v0.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What failed?
+      description: Include the exact install, launch, or checksum behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Downloaded ...
+        2. Ran ...
+        3. Saw ...
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Windows edition, CPU architecture, antivirus or SmartScreen notes, and whether portable or installer was used.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or diagnostics
+      description: Attach a redacted diagnostics bundle if the app opens, or paste installer/build output if it does not.

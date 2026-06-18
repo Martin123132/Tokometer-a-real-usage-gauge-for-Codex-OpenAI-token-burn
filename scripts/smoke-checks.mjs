@@ -89,7 +89,43 @@ async function runScenario(name, lines, nowIso, validator, options = {}) {
   }
 }
 
+async function runEmptyCodexScenario() {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tokometer-smoke-empty-'))
+  const codexHome = path.join(root, '.codex')
+  const dataDir = path.join(root, 'data')
+
+  try {
+    await mkdir(codexHome, { recursive: true })
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    assert(summary.source.filesScanned === 0, 'expected no discovered JSONL files')
+    assert(summary.source.eventsFound === 0, 'expected no usage events')
+    assert(summary.freshness.latestEventAt === null, 'expected no latest event')
+    assert(
+      summary.source.warnings.some((warning) => warning.includes('No Codex JSONL')),
+      'expected no-log scan warning',
+    )
+    printSummary(
+      'first-run empty Codex home',
+      true,
+      'UI check: this payload should show First Run Check with setup failures',
+    )
+  } catch (error) {
+    printSummary('first-run empty Codex home', false, error.message)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}
+
 async function run() {
+  await runEmptyCodexScenario()
+
   await runScenario(
     'stale log file',
     [
@@ -356,6 +392,70 @@ async function run() {
       )
     },
   )
+
+  await runScenario(
+    'large non-token-heavy log',
+    [
+      ...Array.from({ length: 25_000 }, (_, index) =>
+        JSON.stringify({
+          timestamp: new Date(
+            Date.parse('2026-05-25T09:00:00.000Z') + index * 1000,
+          ).toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'agent_message',
+            id: `smoke-message-${index}`,
+          },
+        }),
+      ),
+      tokenLine(
+        '2026-05-25T10:00:00.000Z',
+        {
+          total: bucket(1_000, 400, 120, 20, 1_140),
+          last: bucket(1_000, 400, 120, 20, 1_140),
+        },
+        35,
+        70,
+      ),
+      tokenLine(
+        '2026-05-25T10:10:00.000Z',
+        {
+          total: bucket(1_900, 820, 150, 24, 2_074),
+          last: bucket(1_900, 820, 150, 24, 2_074),
+        },
+        37,
+        72,
+      ),
+      tokenLine(
+        '2026-05-25T10:20:00.000Z',
+        {
+          total: bucket(2_700, 1_180, 190, 30, 2_920),
+          last: bucket(2_700, 1_180, 190, 30, 2_920),
+        },
+        39,
+        74,
+      ),
+    ],
+    '2026-05-25T10:30:00.000Z',
+    (summary) => {
+      assert(summary.source.parseDiagnostics.nonTokenLines === 25_000, 'expected non-token lines to be skipped cleanly')
+      assert(summary.source.parseDiagnostics.malformedLines === 0, 'expected no malformed lines from ordinary non-token JSONL')
+      assert(summary.source.largestFileLines === 25_003, 'expected largest file line metric')
+      assert(summary.source.filesParsed === 1, 'expected one freshly parsed file')
+      assert(summary.source.scanDurationMs >= 0, 'expected scan timing metric')
+      assert(
+        summary.source.warnings.some((warning) => warning.includes('non-token JSONL lines')),
+        'expected large non-token scan warning',
+      )
+      assert(summary.windows.lastHour.totalTokens === 1_780, 'expected token deltas to survive large non-token scan')
+    },
+  )
+
+  console.log('UI smoke checklist:')
+  console.log('   - First Run Check appears for the empty Codex home payload.')
+  console.log('   - Healthy System Check appears after valid token_count fixtures load.')
+  console.log('   - Diagnostics opens Support Bundle Preview before downloading.')
+  console.log('   - Calibration Logbook shows sample count, mean drift, latest drift, and confidence.')
 }
 
 run().catch((error) => {

@@ -1,4 +1,11 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -676,6 +683,139 @@ describe('usage parser', () => {
     expect(summary.windows.lastHour.totalTokens).toBe(280)
     expect(summary.limits.secondary.usedPercent).toBe(52)
   })
+
+  it('skips large non-token-heavy logs without treating them as malformed', async () => {
+    const nonTokenLines = Array.from({ length: 30_000 }, (_, index) =>
+      JSON.stringify({
+        timestamp: new Date(
+          Date.parse('2026-05-25T09:00:00.000Z') + index * 1000,
+        ).toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'agent_message',
+          id: `message-${index}`,
+        },
+      }),
+    )
+    const tokenLines = [
+      tokenLine('2026-05-25T10:00:00.000Z', 100, 20, 10, 5, 115, 30, 50),
+      tokenLine('2026-05-25T10:05:00.000Z', 350, 70, 20, 10, 380, 31, 51),
+      tokenLine('2026-05-25T10:10:00.000Z', 500, 90, 40, 12, 552, 32, 52),
+    ]
+
+    const { codexHome, dataDir } = await createFixture([
+      ...nonTokenLines,
+      ...tokenLines,
+    ])
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.source.parseDiagnostics.parsedLines).toBe(30_003)
+    expect(summary.source.parseDiagnostics.nonTokenLines).toBe(30_000)
+    expect(summary.source.parseDiagnostics.malformedLines).toBe(0)
+    expect(summary.source.parseDiagnostics.parseFailures).toBe(0)
+    expect(summary.source.parseDiagnostics.tokenRecords).toBe(3)
+    expect(summary.source.eventsFound).toBe(2)
+    expect(summary.source.largestFileLines).toBe(30_003)
+    expect(summary.source.scanDurationMs).toBeGreaterThanOrEqual(0)
+    expect(summary.source.warnings.join(' ')).toContain('non-token JSONL lines')
+  })
+
+  it('reports parser cache reuse between uncached summary refreshes', async () => {
+    const { codexHome, dataDir } = await createFixture([
+      tokenLine('2026-05-25T10:00:00.000Z', 100, 20, 10, 5, 115, 30, 50),
+      tokenLine('2026-05-25T10:05:00.000Z', 350, 70, 20, 10, 380, 31, 51),
+      tokenLine('2026-05-25T10:10:00.000Z', 500, 90, 40, 12, 552, 32, 52),
+    ])
+
+    const first = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+    const second = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:31:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(first.source.filesParsed).toBe(1)
+    expect(first.source.filesFromCache).toBe(0)
+    expect(second.source.filesParsed).toBe(0)
+    expect(second.source.filesFromCache).toBe(1)
+    expect(second.source.eventsFound).toBe(first.source.eventsFound)
+  })
+
+  it('invalidates parser cache when an append-only session grows', async () => {
+    const { codexHome, dataDir, sessionPath } = await createFixture([
+      tokenLine('2026-05-25T10:00:00.000Z', 100, 20, 10, 5, 115, 30, 50),
+      tokenLine('2026-05-25T10:05:00.000Z', 350, 70, 20, 10, 380, 31, 51),
+      tokenLine('2026-05-25T10:10:00.000Z', 500, 90, 40, 12, 552, 32, 52),
+    ])
+
+    await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+    await appendFile(
+      sessionPath,
+      `${tokenLine('2026-05-25T10:15:00.000Z', 650, 130, 50, 15, 715, 33, 53)}\n`,
+      'utf8',
+    )
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:31:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.source.filesParsed).toBe(1)
+    expect(summary.source.filesFromCache).toBe(0)
+    expect(summary.source.parseDiagnostics.tokenRecords).toBe(4)
+    expect(summary.source.eventsFound).toBe(3)
+    expect(summary.windows.lastHour.totalTokens).toBe(600)
+  })
+
+  it('includes archived sessions in scan metrics and session totals', async () => {
+    const { codexHome, dataDir } = await createFixture(
+      [
+        tokenLine('2026-05-25T10:00:00.000Z', 100, 20, 10, 5, 115, 30, 50),
+        tokenLine('2026-05-25T10:05:00.000Z', 350, 70, 20, 10, 380, 31, 51),
+      ],
+      [
+        tokenLine('2026-05-25T09:00:00.000Z', 200, 80, 30, 10, 240, 20, 40),
+        tokenLine('2026-05-25T09:10:00.000Z', 460, 100, 80, 20, 560, 22, 42),
+      ],
+    )
+
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.source.filesScanned).toBe(2)
+    expect(summary.source.filesParsed).toBe(2)
+    expect(summary.source.sessionsFound).toBe(2)
+    expect(summary.source.parseDiagnostics.files).toHaveLength(2)
+    expect(summary.source.eventsFound).toBe(2)
+    expect(summary.windows.lastDay.totalTokens).toBe(585)
+  })
 })
 
 describe('projection confidence', () => {
@@ -814,21 +954,38 @@ describe('projection confidence', () => {
   })
 })
 
-async function createFixture(lines: string[]) {
+async function createFixture(lines: string[], archivedLines: string[] = []) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'tokometer-'))
   tempRoots.push(root)
 
   const codexHome = path.join(root, '.codex')
   const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '25')
   const dataDir = path.join(root, 'data')
+  const sessionPath = path.join(sessionDir, 'rollout-test-session.jsonl')
   await mkdir(sessionDir, { recursive: true })
   await writeFile(
-    path.join(sessionDir, 'rollout-test-session.jsonl'),
+    sessionPath,
     `${lines.join('\n')}\n`,
     'utf8',
   )
 
-  return { codexHome, dataDir }
+  if (archivedLines.length > 0) {
+    const archivedDir = path.join(
+      codexHome,
+      'archived_sessions',
+      '2026',
+      '05',
+      '25',
+    )
+    await mkdir(archivedDir, { recursive: true })
+    await writeFile(
+      path.join(archivedDir, 'rollout-archived-test-session.jsonl'),
+      `${archivedLines.join('\n')}\n`,
+      'utf8',
+    )
+  }
+
+  return { codexHome, dataDir, sessionPath }
 }
 
 function tokenLine(

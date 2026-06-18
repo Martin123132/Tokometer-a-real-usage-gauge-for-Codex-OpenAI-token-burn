@@ -7,8 +7,10 @@ Tokometer reads local Codex `token_count` metadata and turns it into an instrume
 It also includes production-readiness surfaces for local installs:
 
 - System Check setup doctor
-- Safe diagnostics bundle export
-- Local app-meter calibration logbook
+- First-run onboarding when local checks fail
+- Support Bundle Preview before safe diagnostics export
+- Local app-meter calibration logbook with drift confidence
+- Parser scan timing and cache metrics
 - Parser regression fixtures and smoke scenarios
 - GitHub Actions CI and packaging workflows
 
@@ -102,8 +104,9 @@ The Settings view stores local UI preferences in browser/Electron local storage:
 
 Settings also includes:
 
-- **System Check**: verifies local log discovery, token events, history writes, parser quality, freshness, rate confidence, and app-meter calibration.
-- **Calibration Logbook**: records visible 5h/weekly app meter samples and their delta from local metadata.
+- **System Check**: verifies local log discovery, token events, history writes, parser quality, scan performance, freshness, rate confidence, and app-meter calibration.
+- **First Run Check**: appears when critical System Check items fail and guides users through paths, logs, history, calibration, and diagnostics.
+- **Calibration Logbook**: records visible 5h/weekly app meter samples, average drift, latest drift, sample count, and confidence.
 
 Runtime paths are still process-level settings. Set `TOKEN_GAUGE_CODEX_HOME` or `TOKEN_GAUGE_DATA_DIR` before starting Tokometer when you need to scan or store data somewhere else.
 
@@ -135,12 +138,14 @@ Known metadata:
 
 - Codex-provided token totals, cached input counts, output counts, reasoning counts, context window, rate-limit percentages, and reset timestamps when present.
 - Per-session cumulative deltas, so repeated `token_count` UI refreshes are not double-counted.
+- Parser scan timing, cache reuse count, largest file line count, and scan warnings.
 
 Estimated or local:
 
 - Burn rate is based on recently observed local metadata.
 - Active burn is calculated as uncached input + output + reasoning.
 - Projection assumes the recent weekly percentage trend continues.
+- Calibration drift summarizes visible app meter samples; it does not automatically correct Tokometer readings.
 
 Important caveat: the visible ChatGPT/Codex app meter can include activity Tokometer cannot see locally, or update on a different cadence. Use the `5h App Meter` and `Weekly App Meter` fields to compare the visible app numbers against local metadata.
 
@@ -150,7 +155,10 @@ Use the dashboard export buttons to export:
 
 - Raw usage summary JSON
 - Markdown report with current limits, burn, alerts, and caveats
-- Redacted diagnostics JSON with settings, confidence, parser health, calibration samples, and no raw JSONL content
+- Redacted diagnostics JSON with settings, confidence, parser health, scan metrics, calibration insights, and no raw JSONL content
+
+The Diagnostics button opens a Support Bundle Preview first. It lists what will
+be exported and what is never exported.
 
 ## Release Builds
 
@@ -163,6 +171,8 @@ npm run dist
 ```
 
 Artifacts are written to `release/`.
+
+See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) for the Windows-first release checklist.
 
 CI is defined in `.github/workflows/ci.yml` and runs lint, tests, build, and smoke scenarios on pushes and pull requests to `main`.
 
@@ -202,6 +212,8 @@ The Vite dev server exposes:
 ## Privacy
 
 Tokometer is local-first. It does not send your Codex logs anywhere. The dashboard fetches from a local API served by the app process.
+
+See [docs/PRIVACY.md](docs/PRIVACY.md) for the diagnostics export policy.
 
 ## License
 

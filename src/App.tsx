@@ -29,6 +29,17 @@ type CalibrationEntry = {
   generatedAt: string | null
 }
 
+type CalibrationConfidence = 'none' | 'low' | 'medium' | 'high'
+
+type CalibrationInsight = {
+  meter: 'primary' | 'weekly'
+  sampleCount: number
+  meanDeltaPoints: number | null
+  latestDeltaPoints: number | null
+  confidence: CalibrationConfidence
+  summary: string
+}
+
 type TokenTotals = {
   inputTokens: number
   cachedInputTokens: number
@@ -103,6 +114,11 @@ type UsageData = {
     codexHome: string
     dataDir: string
     filesScanned: number
+    scanDurationMs: number
+    filesParsed: number
+    filesFromCache: number
+    largestFileLines: number
+    warnings: string[]
     eventsFound: number
     sessionsFound: number
     rawTokenRecords: number
@@ -216,7 +232,11 @@ const legacyPrimaryMeterStorageKey = 'token-gauge-primary-meter'
 const weeklyMeterStorageKey = 'tokometer-weekly-meter'
 const legacyWeeklyMeterStorageKey = 'token-gauge-meter'
 const calibrationHistoryStorageKey = 'tokometer-calibration-history-v1'
+const onboardingDismissedStorageKey = 'tokometer-onboarding-dismissed-v1'
 const calibrationHistoryLimit = 80
+const appVersion = '0.1.0'
+const releaseChannel = 'local-first'
+const diagnosticsSchema = 'tokometer-diagnostics-v1'
 
 function App() {
   const [data, setData] = useState<UsageData | null>(null)
@@ -224,6 +244,10 @@ function App() {
   const [loading, setLoading] = useState(true)
   const [viewMode, setViewMode] = useState<ViewMode>('dashboard')
   const [settings, setSettings] = useState(loadSettings)
+  const [supportPreviewOpen, setSupportPreviewOpen] = useState(false)
+  const [onboardingDismissed, setOnboardingDismissed] = useState(() => {
+    return window.localStorage.getItem(onboardingDismissedStorageKey) === 'true'
+  })
   const [meterOverride, setMeterOverride] = useState(() => {
     return (
       window.localStorage.getItem(weeklyMeterStorageKey) ??
@@ -239,6 +263,10 @@ function App() {
     )
   })
   const [calibrationHistory, setCalibrationHistory] = useState(loadCalibrationHistory)
+  const calibrationInsights = useMemo(
+    () => buildCalibrationInsights(calibrationHistory),
+    [calibrationHistory],
+  )
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -322,8 +350,11 @@ function App() {
     [data, settings, primaryMeterOverride, meterOverride],
   )
   const systemHealth = summarizeSystemChecks(systemChecks)
+  const hasSystemFailures = systemChecks.some((check) => check.status === 'fail')
+  const showFirstRun =
+    viewMode === 'dashboard' && hasSystemFailures && !onboardingDismissed
 
-  const qualityNotes = useMemo(() => {
+  const qualityNotes = (() => {
     const items: string[] = []
     if (staleAgeMinutes !== null && staleByRefreshWindow) {
       items.push(
@@ -339,19 +370,17 @@ function App() {
     if (parseDiagnostics?.ignoredEvents && parseDiagnostics.ignoredEvents > 0) {
       items.push(`Ignored ${parseDiagnostics.ignoredEvents} noisy/reset token samples.`)
     }
+    if (data?.source.scanDurationMs !== undefined && data.source.scanDurationMs > 3_000) {
+      items.push(
+        `Last scan took ${(data.source.scanDurationMs / 1000).toFixed(1)}s; parser cache should improve the next refresh.`,
+      )
+    }
+    data?.source.warnings?.forEach((warning) => items.push(warning))
     if (hasLowConfidenceProjection) {
       items.push(`Projection confidence: ${projectionConfidence.level} - ${projectionConfidence.reason}`)
     }
     return items
-  }, [
-    staleAgeMinutes,
-    staleByRefreshWindow,
-    staleRefreshWindowMinutes,
-    parseWarningRate,
-    parseDiagnostics,
-    hasLowConfidenceProjection,
-    projectionConfidence,
-  ])
+  })()
 
   const setPrimaryMeterValue = (nextValue: string) => {
     setPrimaryMeterOverride(nextValue)
@@ -385,6 +414,11 @@ function App() {
   const clearCalibrationHistory = () => {
     setCalibrationHistory([])
     window.localStorage.removeItem(calibrationHistoryStorageKey)
+  }
+
+  const dismissOnboarding = () => {
+    setOnboardingDismissed(true)
+    window.localStorage.setItem(onboardingDismissedStorageKey, 'true')
   }
 
   const resetSettings = () => {
@@ -471,10 +505,12 @@ function App() {
               {hasSampleWarning ? (
                 <StatusPill tone="warning" label="Sample Warning" />
               ) : null}
+              <span>v{appVersion}</span>
               <span>Token Gauge</span>
               <span>{formatPlan(data?.latest.planType)}</span>
               <span>{data?.source.eventsFound.toLocaleString()} events</span>
               <span>{data?.source.sessionsFound} sessions</span>
+              <span>{data?.source.scanDurationMs ?? 0}ms scan</span>
             </div>
           </div>
           <div className="topbar-actions">
@@ -493,21 +529,37 @@ function App() {
             </button>
             <button
               type="button"
-              onClick={() =>
-                exportDiagnosticsBundle(
-                  data,
-                  settings,
-                  primaryMeterOverride,
-                  meterOverride,
-                  systemChecks,
-                  calibrationHistory,
-                )
-              }
+              onClick={() => setSupportPreviewOpen(true)}
             >
               Diagnostics
             </button>
           </div>
         </header>
+
+        {supportPreviewOpen ? (
+          <SupportBundlePreview
+            data={data}
+            settings={settings}
+            primaryMeterOverride={primaryMeterOverride}
+            weeklyMeterOverride={meterOverride}
+            systemChecks={systemChecks}
+            calibrationHistory={calibrationHistory}
+            calibrationInsights={calibrationInsights}
+            onClose={() => setSupportPreviewOpen(false)}
+            onDownload={() => {
+              exportDiagnosticsBundle(
+                data,
+                settings,
+                primaryMeterOverride,
+                meterOverride,
+                systemChecks,
+                calibrationHistory,
+                calibrationInsights,
+              )
+              setSupportPreviewOpen(false)
+            }}
+          />
+        ) : null}
 
         {qualityNotes.length > 0 ? (
           <section className="sample-warning-strip">
@@ -530,6 +582,7 @@ function App() {
             }
             systemChecks={systemChecks}
             calibrationHistory={calibrationHistory}
+            calibrationInsights={calibrationInsights}
             primaryMeterOverride={primaryMeterOverride}
             weeklyMeterOverride={meterOverride}
             onPrimaryMeterChange={setPrimaryMeterValue}
@@ -540,6 +593,16 @@ function App() {
           />
         ) : (
           <>
+        {showFirstRun ? (
+          <FirstRunPanel
+            data={data}
+            checks={systemChecks}
+            onOpenSettings={() => setViewMode('settings')}
+            onDiagnostics={() => setSupportPreviewOpen(true)}
+            onDismiss={dismissOnboarding}
+          />
+        ) : null}
+
         <section className="cluster-grid">
           <section className="instrument-panel main-cluster">
             <Gauge
@@ -668,6 +731,197 @@ function LoadingPanel() {
   )
 }
 
+function FirstRunPanel({
+  data,
+  checks,
+  onOpenSettings,
+  onDiagnostics,
+  onDismiss,
+}: {
+  data: UsageData | null
+  checks: SystemCheck[]
+  onOpenSettings: () => void
+  onDiagnostics: () => void
+  onDismiss: () => void
+}) {
+  const checkById = new Map(checks.map((check) => [check.id, check]))
+  const rows = [
+    {
+      label: 'Codex path detected',
+      status: checkById.get('codex-log-path')?.status ?? 'fail',
+      detail:
+        data?.source.codexHome ??
+        checkById.get('codex-log-path')?.detail ??
+        'Waiting for local Codex path.',
+    },
+    {
+      label: 'Logs found',
+      status: checkById.get('token-events')?.status ?? 'fail',
+      detail:
+        data && data.source.filesScanned > 0
+          ? `${data.source.filesScanned} files, ${data.source.rawTokenRecords} token records.`
+          : checkById.get('token-events')?.detail ?? 'No token records found yet.',
+    },
+    {
+      label: 'History writable',
+      status: checkById.get('history-store')?.status ?? 'warn',
+      detail: checkById.get('history-store')?.detail ?? 'No history sample yet.',
+    },
+    {
+      label: 'Calibration optional',
+      status: checkById.get('visible-meter-calibration')?.status ?? 'warn',
+      detail: checkById.get('visible-meter-calibration')?.detail ?? 'Visible app meter comparison is optional.',
+    },
+    {
+      label: 'Diagnostics ready',
+      status: 'pass' as const,
+      detail: 'Support bundle preview is available before export.',
+    },
+  ]
+
+  return (
+    <section className="instrument-panel first-run-panel">
+      <div className="first-run-copy">
+        <StatusPill tone="danger" label="Setup Needed" />
+        <h2>First Run Check</h2>
+        <p>
+          Tokometer can still open, but one or more local checks need attention before the gauge is trustworthy.
+        </p>
+      </div>
+      <div className="first-run-steps">
+        {rows.map((row) => (
+          <div className={`first-run-step ${row.status}`} key={row.label}>
+            <strong>{row.label}</strong>
+            <span>{row.detail}</span>
+          </div>
+        ))}
+      </div>
+      <div className="first-run-actions">
+        <button type="button" onClick={onOpenSettings}>
+          Open Settings
+        </button>
+        <button type="button" onClick={onDiagnostics}>
+          Preview Support Bundle
+        </button>
+        <button type="button" onClick={onDismiss}>
+          Dismiss
+        </button>
+      </div>
+    </section>
+  )
+}
+
+function SupportBundlePreview({
+  data,
+  settings,
+  primaryMeterOverride,
+  weeklyMeterOverride,
+  systemChecks,
+  calibrationHistory,
+  calibrationInsights,
+  onClose,
+  onDownload,
+}: {
+  data: UsageData | null
+  settings: AppSettings
+  primaryMeterOverride: string
+  weeklyMeterOverride: string
+  systemChecks: SystemCheck[]
+  calibrationHistory: CalibrationEntry[]
+  calibrationInsights: CalibrationInsight[]
+  onClose: () => void
+  onDownload: () => void
+}) {
+  const included = [
+    `App metadata: Tokometer v${appVersion}, release channel, browser runtime.`,
+    `Redacted paths: Codex home and history store with username removed.`,
+    `Scan metrics: ${data?.source.scanDurationMs ?? 0}ms, ${data?.source.filesScanned ?? 0} files, ${data?.source.filesFromCache ?? 0} from cache.`,
+    `Parser health: line counts, skipped non-token lines, malformed candidates, reset/anomaly counts.`,
+    `Window summaries: token totals, observed minutes, rate confidence, freshness.`,
+    `System checks: ${systemChecks.length} local readiness checks.`,
+    `Calibration: ${calibrationHistory.length} samples plus drift confidence summaries.`,
+    `Settings and meter overrides: refresh, thresholds, anomaly policy, visible meter values.`,
+  ]
+  const excluded = [
+    'Raw JSONL log lines.',
+    'Conversation text, prompts, model replies, and tool outputs.',
+    'Full session identifiers and full local usernames in paths.',
+    'Environment variables, API keys, auth tokens, and payment details.',
+    'Network calls to OpenAI or any external service.',
+  ]
+  const preview = data
+    ? createDiagnosticsBundle(
+        data,
+        settings,
+        primaryMeterOverride,
+        weeklyMeterOverride,
+        systemChecks,
+        calibrationHistory,
+        calibrationInsights,
+      )
+    : null
+
+  return (
+    <section className="support-preview-backdrop" role="dialog" aria-modal="true">
+      <div className="instrument-panel support-preview">
+        <div className="panel-heading">
+          <h2>Support Bundle Preview</h2>
+          <StatusPill tone="known" label="Redacted" />
+        </div>
+        <div className="support-preview-grid">
+          <div>
+            <h3>Included</h3>
+            <ul>
+              {included.map((item) => (
+                <li key={item}>{item}</li>
+              ))}
+            </ul>
+          </div>
+          <div>
+            <h3>Never Exported</h3>
+            <ul>
+              {excluded.map((item) => (
+                <li key={item}>{item}</li>
+              ))}
+            </ul>
+          </div>
+        </div>
+        <pre className="support-preview-json">
+          {JSON.stringify(
+            {
+              schema: preview?.schema ?? diagnosticsSchema,
+              app: preview?.app ?? {
+                name: 'Tokometer',
+                version: appVersion,
+                releaseChannel,
+              },
+              source: preview?.source ?? null,
+              parseDiagnostics: preview
+                ? {
+                    parsedLines: preview.parseDiagnostics.parsedLines,
+                    nonTokenLines: preview.parseDiagnostics.nonTokenLines,
+                    files: preview.parseDiagnostics.files.length,
+                  }
+                : null,
+              calibrationInsights: preview?.calibrationInsights ?? calibrationInsights,
+            },
+            null,
+            2,
+          )}
+        </pre>
+        <div className="support-preview-actions">
+          <button type="button" onClick={onDownload} disabled={!data}>
+            Download Diagnostics
+          </button>
+          <button type="button" onClick={onClose}>
+            Close
+          </button>
+        </div>
+      </div>
+    </section>
+  )
+}
+
 function RailIcon({
   label,
   path,
@@ -702,6 +956,7 @@ function SettingsView({
   onApplyRecommendedPolicy,
   systemChecks,
   calibrationHistory,
+  calibrationInsights,
   primaryMeterOverride,
   weeklyMeterOverride,
   onPrimaryMeterChange,
@@ -717,6 +972,7 @@ function SettingsView({
   onApplyRecommendedPolicy: (policy: AnomalyPolicy) => void
   systemChecks: SystemCheck[]
   calibrationHistory: CalibrationEntry[]
+  calibrationInsights: CalibrationInsight[]
   primaryMeterOverride: string
   weeklyMeterOverride: string
   onPrimaryMeterChange: (value: string) => void
@@ -837,6 +1093,7 @@ function SettingsView({
 
       <CalibrationHistoryPanel
         entries={calibrationHistory}
+        insights={calibrationInsights}
         onClear={onClearCalibrationHistory}
       />
 
@@ -859,6 +1116,8 @@ function SettingsView({
           <span>Desktop build</span>
         </div>
         <div className="release-list">
+          <ReleaseLine label="Version" value={`v${appVersion}`} />
+          <ReleaseLine label="Channel" value={releaseChannel} />
           <ReleaseLine label="Dev shell" value="npm run desktop" />
           <ReleaseLine label="Prod shell" value="npm run desktop:prod" />
           <ReleaseLine label="Installer" value="npm run dist" />
@@ -1051,9 +1310,11 @@ function SystemCheckPanel({
 
 function CalibrationHistoryPanel({
   entries,
+  insights,
   onClear,
 }: {
   entries: CalibrationEntry[]
+  insights: CalibrationInsight[]
   onClear: () => void
 }) {
   const recentEntries = entries.slice(0, 8)
@@ -1063,6 +1324,19 @@ function CalibrationHistoryPanel({
       <div className="panel-heading">
         <h2>Calibration Logbook</h2>
         <span>{entries.length} samples</span>
+      </div>
+      <div className="calibration-insight-grid">
+        {insights.map((insight) => (
+          <div className={`calibration-insight ${insight.confidence}`} key={insight.meter}>
+            <span>{insight.meter === 'primary' ? '5h drift' : 'Weekly drift'}</span>
+            <strong>
+              {insight.meanDeltaPoints === null
+                ? 'No baseline'
+                : `${insight.meanDeltaPoints >= 0 ? '+' : ''}${insight.meanDeltaPoints.toFixed(1)} pts`}
+            </strong>
+            <em>{insight.summary}</em>
+          </div>
+        ))}
       </div>
       {recentEntries.length > 0 ? (
         <div className="calibration-history-list">
@@ -1138,6 +1412,67 @@ function formatConfidenceText(confidence?: DataConfidence | null): string {
     return 'No confidence metadata'
   }
   return `${confidence.level} (${Math.round(confidence.score * 100)}%)`
+}
+
+function buildCalibrationInsights(entries: CalibrationEntry[]): CalibrationInsight[] {
+  return (['primary', 'weekly'] as const).map((meter) => {
+    const samples = entries.filter(
+      (entry) =>
+        entry.meter === meter &&
+        typeof entry.deltaPoints === 'number' &&
+        Number.isFinite(entry.deltaPoints),
+    )
+    const sampleCount = samples.length
+    const latestDeltaPoints = samples.at(0)?.deltaPoints ?? null
+
+    if (sampleCount < 3) {
+      return {
+        meter,
+        sampleCount,
+        meanDeltaPoints: sampleCount === 0
+          ? null
+          : samples.reduce((sum, sample) => sum + (sample.deltaPoints ?? 0), 0) /
+            sampleCount,
+        latestDeltaPoints,
+        confidence: sampleCount === 0 ? 'none' : 'low',
+        summary:
+          sampleCount === 0
+            ? 'No visible app samples yet.'
+            : `Need ${3 - sampleCount} more sample${sampleCount === 2 ? '' : 's'} before drift is meaningful.`,
+      }
+    }
+
+    const meanDeltaPoints =
+      samples.reduce((sum, sample) => sum + (sample.deltaPoints ?? 0), 0) /
+      sampleCount
+    const variance =
+      samples.reduce(
+        (sum, sample) => sum + ((sample.deltaPoints ?? 0) - meanDeltaPoints) ** 2,
+        0,
+      ) / sampleCount
+    const standardDeviation = Math.sqrt(variance)
+    const confidence: CalibrationConfidence =
+      sampleCount >= 10 && standardDeviation <= 6
+        ? 'high'
+        : sampleCount >= 6 && standardDeviation <= 8
+          ? 'medium'
+          : 'low'
+    const direction =
+      Math.abs(meanDeltaPoints) < 1
+        ? 'roughly aligned with'
+        : meanDeltaPoints > 0
+          ? 'usually above'
+          : 'usually below'
+
+    return {
+      meter,
+      sampleCount,
+      meanDeltaPoints,
+      latestDeltaPoints,
+      confidence,
+      summary: `Visible app is ${direction} local metadata (${sampleCount} samples, latest ${formatSignedPoints(latestDeltaPoints)}). Auto-correction remains off.`,
+    }
+  })
 }
 
 function Gauge({
@@ -1476,6 +1811,21 @@ function AccuracyPanel({
             detail={`${parseDiagnostics?.usedEvents?.toLocaleString() ?? 0} events kept, ${parseDiagnostics?.nonTokenLines?.toLocaleString() ?? 0} non-token lines ignored`}
             footer={`Fallback totals: ${parseDiagnostics?.fallbackTokenSourceUsed?.toLocaleString() ?? 0}`}
           />
+          <ConfidenceTile
+            label="Scan time"
+            value={`${data?.source.scanDurationMs ?? 0}ms`}
+            detail={`${data?.source.filesParsed ?? 0} parsed, ${data?.source.filesFromCache ?? 0} cached`}
+            footer={`Largest file: ${(data?.source.largestFileLines ?? 0).toLocaleString()} lines`}
+          />
+          <ConfidenceTile
+            label="Scan warnings"
+            value={data?.source.warnings.length ?? 0}
+            detail={
+              data?.source.warnings.length
+                ? data.source.warnings[0]
+                : 'No scan performance warnings'
+            }
+          />
         </div>
       </div>
       <div className="accuracy-meter">
@@ -1625,6 +1975,17 @@ function buildClientAlerts(
     })
   }
 
+  if (data.source.scanDurationMs > 3_000 || data.source.warnings.length > 0) {
+    alerts.unshift({
+      id: 'ui-scan-warning',
+      severity: data.source.scanDurationMs > 10_000 ? 'danger' : 'warning',
+      title: 'Parser scan warning',
+      detail:
+        data.source.warnings[0] ??
+        `Last usage scan took ${(data.source.scanDurationMs / 1000).toFixed(1)} seconds.`,
+    })
+  }
+
   if (Number.isFinite(weeklyDelta) && Math.abs(weeklyDelta) >= settings.mismatchThreshold) {
     alerts.unshift({
       id: 'weekly-meter-mismatch',
@@ -1675,6 +2036,7 @@ function exportDiagnosticsBundle(
   weeklyMeterOverride: string,
   systemChecks: SystemCheck[],
   calibrationHistory: CalibrationEntry[],
+  calibrationInsights: CalibrationInsight[],
 ) {
   if (!data) {
     return
@@ -1691,6 +2053,7 @@ function exportDiagnosticsBundle(
         weeklyMeterOverride,
         systemChecks,
         calibrationHistory,
+        calibrationInsights,
       ),
       null,
       2,
@@ -1706,15 +2069,18 @@ function createDiagnosticsBundle(
   weeklyMeterOverride: string,
   systemChecks: SystemCheck[],
   calibrationHistory: CalibrationEntry[],
+  calibrationInsights: CalibrationInsight[],
 ) {
   return {
-    schema: 'tokometer-diagnostics-v1',
+    schema: diagnosticsSchema,
     exportedAt: new Date().toISOString(),
     privacy:
       'This bundle excludes raw JSONL log lines and full session identifiers.',
     app: {
       name: 'Tokometer',
-      version: '0.1.0',
+      version: appVersion,
+      releaseChannel,
+      mode: import.meta.env.MODE,
       userAgent: window.navigator.userAgent,
     },
     settings,
@@ -1728,6 +2094,11 @@ function createDiagnosticsBundle(
       codexHome: redactPath(data.source.codexHome),
       dataDir: redactPath(data.source.dataDir),
       filesScanned: data.source.filesScanned,
+      scanDurationMs: data.source.scanDurationMs,
+      filesParsed: data.source.filesParsed,
+      filesFromCache: data.source.filesFromCache,
+      largestFileLines: data.source.largestFileLines,
+      warnings: data.source.warnings,
       eventsFound: data.source.eventsFound,
       sessionsFound: data.source.sessionsFound,
       rawTokenRecords: data.source.rawTokenRecords,
@@ -1758,6 +2129,7 @@ function createDiagnosticsBundle(
     },
     systemChecks,
     calibrationHistory: calibrationHistory.slice(0, 30),
+    calibrationInsights,
     alerts: data.alerts,
     accuracy: data.accuracy,
   }
@@ -1779,9 +2151,11 @@ function createMarkdownReport(data: UsageData) {
   return [
     '# Tokometer Report',
     '',
+    `Version: v${appVersion} (${releaseChannel})`,
     `Generated: ${data.source.generatedAt}`,
     `Codex home: ${data.source.codexHome}`,
     `History store: ${data.source.dataDir}`,
+    `Scan: ${data.source.scanDurationMs}ms; ${data.source.filesParsed} files parsed, ${data.source.filesFromCache} from cache, largest file ${data.source.largestFileLines} lines`,
     '',
     '## Limits',
     '',
@@ -1792,6 +2166,7 @@ function createMarkdownReport(data: UsageData) {
     `- Latest sample age: ${data.freshness.latestEventAgeMinutes ?? 0}m`,
     `- Parse lines: ${data.source.parseDiagnostics.parsedLines} parsed, ${data.source.parseDiagnostics.nonTokenLines} non-token, ${data.source.parseDiagnostics.malformedLines} malformed, ${data.source.parseDiagnostics.parseFailures} parse failures`,
     `- Ignored samples: ${data.source.parseDiagnostics.ignoredEvents} (${data.source.parseDiagnostics.resetEvents} resets, ${data.source.parseDiagnostics.anomalousDeltas} anomalies)`,
+    `- Scan warnings: ${data.source.warnings.length ? data.source.warnings.join(' ') : 'None'}`,
     '',
     '## Parse File Summary',
     ...fileSummaries.map((item) => `- ${item}`),
@@ -1844,6 +2219,13 @@ function formatTokens(value: number) {
 
 function formatPercent(value?: number | null) {
   return typeof value === 'number' ? `${value.toFixed(0)}%` : 'Unknown'
+}
+
+function formatSignedPoints(value?: number | null) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return 'unknown'
+  }
+  return `${value >= 0 ? '+' : ''}${value.toFixed(1)} pts`
 }
 
 function formatDate(value?: string | null) {
@@ -2081,6 +2463,17 @@ function buildSystemChecks(
       detail: `${Math.round(parseIssueRatio * 100)}% parse issues, ${Math.round(
         ignoredRatio * 100,
       )}% ignored/reset/anomaly samples.`,
+    },
+    {
+      id: 'scan-performance',
+      label: 'Scan performance',
+      status:
+        data.source.scanDurationMs > 10_000
+          ? 'fail'
+          : data.source.scanDurationMs > 3_000 || data.source.warnings.length > 0
+            ? 'warn'
+            : 'pass',
+      detail: `${data.source.scanDurationMs}ms scan; ${data.source.filesFromCache}/${data.source.filesScanned} files reused from cache, largest file ${data.source.largestFileLines.toLocaleString()} lines.`,
     },
     {
       id: 'freshness',

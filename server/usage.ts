@@ -77,6 +77,14 @@ type ParseDiagnostics = {
   files: ParseFileHealth[]
 }
 
+type ScanMetrics = {
+  scanDurationMs: number
+  filesParsed: number
+  filesFromCache: number
+  largestFileLines: number
+  warnings: string[]
+}
+
 type TokenBucket = {
   input_tokens?: number
   cached_input_tokens?: number
@@ -173,6 +181,11 @@ export type UsageSummary = {
     codexHome: string
     dataDir: string
     filesScanned: number
+    scanDurationMs: number
+    filesParsed: number
+    filesFromCache: number
+    largestFileLines: number
+    warnings: string[]
     eventsFound: number
     rawTokenRecords: number
     ignoredEvents: number
@@ -247,7 +260,11 @@ export type UsageOptions = {
 }
 
 let cache: { key: string; expiresAt: number; value: UsageSummary } | null = null
-type ParsedTokenEvents = { events: TokenEvent[]; diagnostics: ParseFileHealth }
+type ParsedTokenEvents = {
+  events: TokenEvent[]
+  diagnostics: ParseFileHealth
+  fromCache: boolean
+}
 const fileCache = new Map<
   string,
   { mtimeMs: number; size: number; parsed: ParsedTokenEvents }
@@ -266,6 +283,7 @@ export async function getUsageSummary(
     return cache.value
   }
 
+  const scanStartedAt = Date.now()
   const roots = [
     { dir: path.join(codexHome, 'sessions'), source: 'sessions' as const },
     {
@@ -286,6 +304,25 @@ export async function getUsageSummary(
     files.map(({ file, source }) => parseTokenEvents(file, source)),
   )
   const parseDiagnostics = aggregateParseDiagnostics(eventGroups)
+  const scanDurationMs = Math.max(0, Date.now() - scanStartedAt)
+  const scanMetrics: ScanMetrics = {
+    scanDurationMs,
+    filesParsed: eventGroups.filter((group) => !group.fromCache).length,
+    filesFromCache: eventGroups.filter((group) => group.fromCache).length,
+    largestFileLines: Math.max(
+      0,
+      ...eventGroups.map((group) => group.diagnostics.parsedLines),
+    ),
+    warnings: buildScanWarnings({
+      scanDurationMs,
+      filesScanned: files.length,
+      parseDiagnostics,
+      largestFileLines: Math.max(
+        0,
+        ...eventGroups.map((group) => group.diagnostics.parsedLines),
+      ),
+    }),
+  }
   const events = eventGroups
     .flatMap((group) => group.events)
     .filter((event) => Number.isFinite(event.timestampMs))
@@ -299,6 +336,7 @@ export async function getUsageSummary(
     now,
     [],
     parseDiagnostics,
+    scanMetrics,
     anomalyPolicy,
   )
   const history = options.writeHistory === false
@@ -391,7 +429,7 @@ async function parseTokenEvents(
     cached.mtimeMs === fileStat.mtimeMs &&
     cached.size === fileStat.size
   ) {
-    return cached.parsed
+    return { ...cached.parsed, fromCache: true }
   }
 
   const sessionId = path.basename(filePath, '.jsonl').replace(/^rollout-/, '')
@@ -480,6 +518,7 @@ async function parseTokenEvents(
   const parsed: ParsedTokenEvents = {
     events,
     diagnostics,
+    fromCache: false,
   }
 
   fileCache.set(filePath, {
@@ -517,6 +556,57 @@ function aggregateParseDiagnostics(
   }
 }
 
+function buildScanWarnings({
+  scanDurationMs,
+  filesScanned,
+  parseDiagnostics,
+  largestFileLines,
+}: {
+  scanDurationMs: number
+  filesScanned: number
+  parseDiagnostics: ParseDiagnostics
+  largestFileLines: number
+}): string[] {
+  const warnings: string[] = []
+
+  if (filesScanned === 0) {
+    warnings.push('No Codex JSONL log files were discovered.')
+  }
+
+  if (scanDurationMs > 3_000) {
+    warnings.push(
+      `Usage scan took ${(scanDurationMs / 1000).toFixed(1)}s; very large logs may need another refresh to warm the cache.`,
+    )
+  }
+
+  if (largestFileLines >= 100_000) {
+    warnings.push(
+      `Largest session log has ${largestFileLines.toLocaleString()} lines; append-only cache reuse is important for responsiveness.`,
+    )
+  }
+
+  if (
+    parseDiagnostics.nonTokenLines >= 25_000 &&
+    parseDiagnostics.nonTokenLines >
+      Math.max(1, parseDiagnostics.tokenRecords) * 50
+  ) {
+    warnings.push(
+      `${parseDiagnostics.nonTokenLines.toLocaleString()} non-token JSONL lines were skipped while looking for token_count records.`,
+    )
+  }
+
+  if (
+    parseDiagnostics.malformedLines + parseDiagnostics.parseFailures >
+    Math.max(3, parseDiagnostics.tokenRecords * 0.1)
+  ) {
+    warnings.push(
+      'Token candidate parse quality is degraded; diagnostics can help file a parser bug without exporting raw logs.',
+    )
+  }
+
+  return warnings
+}
+
 function buildSummary(
   codexHome: string,
   dataDir: string,
@@ -525,6 +615,7 @@ function buildSummary(
   now: number,
   samples: HistoryPoint[],
   parseDiagnostics: ParseDiagnostics,
+  scanMetrics: ScanMetrics,
   anomalyPolicy: AnomalyPolicy,
 ): UsageSummary {
   const latest = events.at(-1)
@@ -564,6 +655,11 @@ function buildSummary(
       codexHome,
       dataDir,
       filesScanned,
+      scanDurationMs: scanMetrics.scanDurationMs,
+      filesParsed: scanMetrics.filesParsed,
+      filesFromCache: scanMetrics.filesFromCache,
+      largestFileLines: scanMetrics.largestFileLines,
+      warnings: scanMetrics.warnings,
       eventsFound: usageEvents.length,
       rawTokenRecords: parseDiagnostics.tokenRecords,
       ignoredEvents:
@@ -628,6 +724,7 @@ function buildSummary(
       known: [
         'Reads Codex token_count events from local session JSONL logs.',
         `Observed ${usageEvents.length.toLocaleString()} deduplicated local deltas from ${parseDiagnostics.tokenRecords.toLocaleString()} token events.`,
+        `Scanned ${filesScanned.toLocaleString()} JSONL files in ${scanMetrics.scanDurationMs}ms (${scanMetrics.filesFromCache.toLocaleString()} reused from parser cache).`,
         parseDiagnostics.fallbackTokenSourceUsed > 0
           ? `${parseDiagnostics.fallbackTokenSourceUsed.toLocaleString()} records used last_token_usage fallback when total_token_usage was missing.`
           : 'Uses total_token_usage as the primary cumulative counter.',
@@ -645,6 +742,9 @@ function buildSummary(
         parseDiagnostics.malformedLines > 0
           ? `${parseDiagnostics.malformedLines} malformed lines were skipped while parsing logs.`
           : 'Parser accepted all discovered token_count lines.',
+        scanMetrics.warnings.length > 0
+          ? `Scan warnings: ${scanMetrics.warnings.join(' ')}`
+          : 'No scan performance warnings were emitted.',
         `Observed deltas were filtered for counter resets (${parseDiagnostics.resetEvents}) and likely anomalies (${parseDiagnostics.anomalousDeltas}).`,
         `Anomaly policy is set to '${anomalyPolicy}' when classifying suspect token deltas.`,
       ],

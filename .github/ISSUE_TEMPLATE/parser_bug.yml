@@ -1,0 +1,46 @@
+name: Parser bug
+description: Report missing, malformed, slow, or incorrect local token parsing.
+title: "[Parser]: "
+labels: ["parser", "bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please attach the redacted Tokometer diagnostics bundle when possible. Do not attach raw Codex JSONL logs.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe what Tokometer showed and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics summary
+      description: Paste the Support Bundle Preview summary or attach the downloaded diagnostics JSON.
+      placeholder: "scanDurationMs, filesScanned, parseDiagnostics totals, warnings..."
+    validations:
+      required: false
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tokometer version
+      placeholder: "v0.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Extra context
+      description: Include whether archived sessions, huge logs, or schema drift were involved.
