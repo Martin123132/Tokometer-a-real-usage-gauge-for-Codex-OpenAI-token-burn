@@ -11,7 +11,9 @@
     "typecheck": "tsc -b",
     "build": "npm run typecheck && vite build && npm run build:server",
     "build:server": "node scripts/build-server.mjs",
+    "icons:generate": "node scripts/generate-icon.mjs",
     "smoke": "npx tsx scripts/smoke-checks.mjs",
+    "release:verify": "node scripts/verify-release.mjs",
     "lint": "eslint .",
     "test": "vitest run",
     "start": "npm run build && tsx server/standalone.ts",
@@ -19,8 +21,8 @@
     "desktop": "node scripts/desktop.mjs",
     "desktop:prod": "npm run build && electron electron/main.cjs",
     "preview": "vite preview",
-    "pack": "npm run build && electron-builder --dir",
-    "dist": "npm run build && electron-builder --publish never"
+    "pack": "npm run icons:generate && npm run build && electron-builder --dir",
+    "dist": "npm run icons:generate && npm run build && electron-builder --publish never"
   },
   "repository": {
     "type": "git",
@@ -58,6 +60,7 @@
     "productName": "Tokometer",
     "asar": true,
     "directories": {
+      "buildResources": "build",
       "output": "release"
     },
     "files": [
@@ -70,6 +73,7 @@
       "LICENSE"
     ],
     "win": {
+      "icon": "build/icon.ico",
       "signAndEditExecutable": false,
       "target": [
         {
@@ -93,6 +97,7 @@
       "category": "public.app-category.developer-tools"
     },
     "linux": {
+      "icon": "build/icon.png",
       "target": [
         "AppImage",
         "deb"

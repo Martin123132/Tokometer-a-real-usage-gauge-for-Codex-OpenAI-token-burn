@@ -7,6 +7,7 @@ a portable build, SHA256 checksums, release notes, and a passing verification ru
 
 - Confirm the working tree is clean with `git status --short`.
 - Install from lockfile with `npm ci`.
+- Regenerate committed icon assets when changing branding with `npm run icons:generate`.
 - Run the standard gate:
   - `npm run lint`
   - `npm test`
@@ -30,12 +31,18 @@ Artifacts are written to `release/`. Expected Windows outputs:
 
 - NSIS installer
 - Portable executable
-- `.sha256` checksum files when produced by the GitHub packaging workflow
+- `.sha256` checksum files when produced by `npm run release:verify -- --write`
 
 For a local checksum spot check in PowerShell:
 
 ```powershell
 Get-FileHash -Algorithm SHA256 release\*
+```
+
+For the project verifier:
+
+```bash
+npm run release:verify
 ```
 
 ## GitHub Release

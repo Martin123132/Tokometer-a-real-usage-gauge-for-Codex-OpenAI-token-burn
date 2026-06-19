@@ -33,13 +33,8 @@ jobs:
       - name: Build installer and portable app
         run: npm run dist
 
-      - name: Create checksums
-        shell: pwsh
-        run: |
-          Get-ChildItem -Path release -File | ForEach-Object {
-            $hash = Get-FileHash -Algorithm SHA256 -Path $_.FullName
-            "$($hash.Hash)  $($_.Name)" | Out-File -FilePath "release/$($_.Name).sha256" -Encoding utf8
-          }
+      - name: Verify artifacts and create checksums
+        run: npm run release:verify -- --write
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

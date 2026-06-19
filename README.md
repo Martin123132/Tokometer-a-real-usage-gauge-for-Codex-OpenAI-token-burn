@@ -82,9 +82,11 @@ This builds the app and serves the production bundle with the local `/api/usage`
 npm run dev       # Vite dev server with local usage API
 npm run desktop   # Electron desktop wrapper
 npm run desktop:prod # Production-style Electron wrapper
+npm run icons:generate # Generate app icon assets
 npm run build     # TypeScript + Vite production build
 npm run pack      # Build unpacked desktop app into release/
 npm run dist      # Build installable desktop artifacts into release/
+npm run release:verify # Verify release artifacts and print SHA256 checksums
 npm run serve     # Serve an existing dist build
 npm run test      # Parser/unit tests
 npm run smoke     # Manual smoke scenarios (requires node / scripts/smoke-checks.mjs)

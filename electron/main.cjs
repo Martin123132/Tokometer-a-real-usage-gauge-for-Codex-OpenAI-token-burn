@@ -29,6 +29,7 @@ async function createWindow() {
     minHeight: 700,
     title: 'Tokometer',
     backgroundColor: '#0a0d11',
+    icon: runtimeIconPath(),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -44,7 +45,7 @@ async function createWindow() {
 
 function createTray() {
   try {
-    const iconPath = path.join(__dirname, '..', 'public', 'favicon.svg')
+    const iconPath = runtimeIconPath()
     const image = nativeImage.createFromPath(iconPath)
     tray = new Tray(image.isEmpty() ? nativeImage.createEmpty() : image)
     tray.setToolTip('Tokometer')
@@ -59,6 +60,10 @@ function createTray() {
   } catch {
     tray = undefined
   }
+}
+
+function runtimeIconPath() {
+  return path.join(__dirname, '..', 'public', 'icon.png')
 }
 
 async function startBundledServer() {
