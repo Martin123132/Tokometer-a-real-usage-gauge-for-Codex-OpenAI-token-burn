@@ -8,7 +8,7 @@ Examples that require a commercial license:
 
 - adding Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn features to a paid coding assistant or AI agent product;
 - running Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn as part of a SaaS, API, hosted MCP server, or managed repository-analysis service;
-- embedding Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn code, schemas, tests, pack format, or derived implementation details into a commercial tool;
+- embedding Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn code, schemas, tests, formats, or derived implementation details into a commercial tool;
 - using Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn materials to train, fine-tune, distill, evaluate, benchmark, or improve a commercial AI model or commercial AI system;
 - distributing a modified commercial version of Tokometer-a-real-usage-gauge-for-Codex-OpenAI-token-burn.
 
