@@ -134,6 +134,19 @@ Override the history folder:
 TOKEN_GAUGE_DATA_DIR=/path/to/tokometer-data npm run dev
 ```
 
+For local development on storage-constrained Windows machines, keep large
+generated files off the system drive by setting:
+
+```powershell
+$env:TOKEN_GAUGE_DATA_DIR="D:\Projects\Tokometer\app-data"
+$env:TOKOMETER_TEMP_DIR="D:\Temp"
+$env:npm_config_cache="D:\Projects\Tokometer\npm-cache"
+```
+
+Run `npm run guard` to check license markers and storage warnings. Release
+packaging (`npm run pack` and `npm run dist`) runs `npm run guard:strict` first
+and refuses to package from `C:\` unless `TOKOMETER_ALLOW_C_DRIVE=1` is set.
+
 ## Known vs Estimated
 
 Known metadata:

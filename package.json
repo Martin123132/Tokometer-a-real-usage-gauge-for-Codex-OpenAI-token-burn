@@ -12,6 +12,8 @@
     "typecheck": "tsc -b",
     "build": "npm run typecheck && vite build && npm run build:server",
     "build:server": "node scripts/build-server.mjs",
+    "guard": "node scripts/storage-license-guard.mjs",
+    "guard:strict": "node scripts/storage-license-guard.mjs --strict-storage",
     "icons:generate": "node scripts/generate-icon.mjs",
     "smoke": "npx tsx scripts/smoke-checks.mjs",
     "release:verify": "node scripts/verify-release.mjs",
@@ -22,8 +24,8 @@
     "desktop": "node scripts/desktop.mjs",
     "desktop:prod": "npm run build && electron electron/main.cjs",
     "preview": "vite preview",
-    "pack": "npm run icons:generate && npm run build && electron-builder --dir",
-    "dist": "npm run icons:generate && npm run build && electron-builder --publish never"
+    "pack": "npm run guard:strict && npm run icons:generate && npm run build && electron-builder --dir",
+    "dist": "npm run guard:strict && npm run icons:generate && npm run build && electron-builder --publish never"
   },
   "repository": {
     "type": "git",

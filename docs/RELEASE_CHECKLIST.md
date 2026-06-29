@@ -11,6 +11,9 @@ a portable build, SHA256 checksums, release notes, and a passing verification ru
   personal and non-commercial use only, commercial use requires a separate
   written license from TWO HANDS NETWORK LTD, and licensing discussions route
   through the COO of TWO HANDS NETWORK LTD.
+- Run `npm run guard:strict` and confirm packaging, npm cache, app data, and
+  smoke temp roots are not accidentally targeting `C:\` unless a maintainer has
+  explicitly set `TOKOMETER_ALLOW_C_DRIVE=1`.
 - Install from lockfile with `npm ci`.
 - Regenerate committed icon assets when changing branding with `npm run icons:generate`.
 - Run the standard gate:
@@ -32,7 +35,8 @@ Run:
 npm run dist
 ```
 
-Artifacts are written to `release/`. Expected Windows outputs:
+Artifacts are written to `release/` under the current repo. Keep the repo on a
+data drive for local release builds. Expected Windows outputs:
 
 - NSIS installer
 - Portable executable

@@ -1,5 +1,6 @@
 import os from 'node:os'
 import path from 'node:path'
+import { existsSync } from 'node:fs'
 import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import {
   getUsageSummary,
@@ -7,6 +8,7 @@ import {
 } from '../server/usage.ts'
 
 const mismatchThreshold = 8
+const smokeTempRoot = resolveSmokeTempRoot()
 
 function tokenLine(timestamp, buckets, primaryUsed, secondaryUsed) {
   return JSON.stringify({
@@ -47,7 +49,8 @@ function bucket(inputTokens, cachedInputTokens, outputTokens, reasoningOutputTok
 }
 
 async function createFixture(lines) {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'tokometer-smoke-'))
+  await mkdir(smokeTempRoot, { recursive: true })
+  const root = await mkdtemp(path.join(smokeTempRoot, 'tokometer-smoke-'))
   const codexHome = path.join(root, '.codex')
   const dataDir = path.join(root, 'data')
   const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '25')
@@ -61,6 +64,18 @@ async function createFixture(lines) {
     sessionPath,
     cleanup: async () => rm(root, { recursive: true, force: true }),
   }
+}
+
+function resolveSmokeTempRoot() {
+  if (process.env.TOKOMETER_TEMP_DIR) {
+    return process.env.TOKOMETER_TEMP_DIR
+  }
+
+  if (process.platform === 'win32' && existsSync('D:\\Temp')) {
+    return 'D:\\Temp'
+  }
+
+  return os.tmpdir()
 }
 
 function assert(condition, message) {
@@ -95,7 +110,8 @@ async function runScenario(name, lines, nowIso, validator, options = {}) {
 }
 
 async function runEmptyCodexScenario() {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'tokometer-smoke-empty-'))
+  await mkdir(smokeTempRoot, { recursive: true })
+  const root = await mkdtemp(path.join(smokeTempRoot, 'tokometer-smoke-empty-'))
   const codexHome = path.join(root, '.codex')
   const dataDir = path.join(root, 'data')
 
