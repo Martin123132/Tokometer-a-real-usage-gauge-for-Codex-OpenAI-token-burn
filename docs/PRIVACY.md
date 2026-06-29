@@ -10,6 +10,7 @@ send logs or diagnostics to OpenAI, GitHub, or any external service.
 - Rate-limit metadata attached to those events, when present.
 - Tokometer local settings stored in browser localStorage.
 - Tokometer history snapshots stored in the local app data folder.
+- Tokometer parser cache files stored under the local app data folder.
 
 ## What Tokometer Ignores
 

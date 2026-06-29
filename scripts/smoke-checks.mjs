@@ -1,7 +1,10 @@
 import os from 'node:os'
 import path from 'node:path'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { getUsageSummary } from '../server/usage.ts'
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import {
+  getUsageSummary,
+  getUsageSummaryWithBackgroundScan,
+} from '../server/usage.ts'
 
 const mismatchThreshold = 8
 
@@ -49,11 +52,13 @@ async function createFixture(lines) {
   const dataDir = path.join(root, 'data')
   const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '25')
   await mkdir(sessionDir, { recursive: true })
-  await writeFile(path.join(sessionDir, 'rollout-smoke-session.jsonl'), `${lines.join('\n')}\n`)
+  const sessionPath = path.join(sessionDir, 'rollout-smoke-session.jsonl')
+  await writeFile(sessionPath, `${lines.join('\n')}\n`)
 
   return {
     codexHome,
     dataDir,
+    sessionPath,
     cleanup: async () => rm(root, { recursive: true, force: true }),
   }
 }
@@ -123,8 +128,192 @@ async function runEmptyCodexScenario() {
   }
 }
 
+async function runParserCacheScenario() {
+  const { codexHome, dataDir, sessionPath, cleanup } = await createFixture([
+    ...Array.from({ length: 10_000 }, (_, index) =>
+      JSON.stringify({
+        timestamp: new Date(
+          Date.parse('2026-05-25T09:00:00.000Z') + index * 1000,
+        ).toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'agent_message',
+          id: `cache-message-${index}`,
+        },
+      }),
+    ),
+    tokenLine(
+      '2026-05-25T10:00:00.000Z',
+      {
+        total: bucket(1_000, 400, 120, 20, 1_140),
+        last: bucket(1_000, 400, 120, 20, 1_140),
+      },
+      35,
+      70,
+    ),
+    tokenLine(
+      '2026-05-25T10:10:00.000Z',
+      {
+        total: bucket(1_900, 820, 150, 24, 2_074),
+        last: bucket(1_900, 820, 150, 24, 2_074),
+      },
+      37,
+      72,
+    ),
+  ])
+
+  try {
+    const first = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+    const second = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:31:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+    await appendFile(
+      sessionPath,
+      `${tokenLine(
+        '2026-05-25T10:20:00.000Z',
+        {
+          total: bucket(2_700, 1_180, 190, 30, 2_920),
+          last: bucket(2_700, 1_180, 190, 30, 2_920),
+        },
+        39,
+        74,
+      )}\n`,
+      'utf8',
+    )
+    const third = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:32:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    assert(first.source.filesParsed === 1, 'expected initial full parse')
+    assert(second.source.filesFromCache === 1, 'expected warm exact cache hit')
+    assert(third.source.filesIncremental === 1, 'expected append-only incremental parse')
+    assert(third.windows.lastHour.totalTokens === 1_780, 'expected incremental totals to match full math')
+    printSummary(
+      'parser cache warm and append',
+      true,
+      `full ${first.source.scanDurationMs}ms, warm ${second.source.scanDurationMs}ms, append ${third.source.scanDurationMs}ms`,
+    )
+  } catch (error) {
+    printSummary('parser cache warm and append', false, error.message)
+  } finally {
+    await cleanup()
+  }
+}
+
+async function runBackgroundRefreshScenario() {
+  const { codexHome, dataDir, sessionPath, cleanup } = await createFixture([
+    tokenLine(
+      '2026-05-25T10:00:00.000Z',
+      {
+        total: bucket(1_000, 400, 120, 20, 1_140),
+        last: bucket(1_000, 400, 120, 20, 1_140),
+      },
+      35,
+      70,
+    ),
+    tokenLine(
+      '2026-05-25T10:05:00.000Z',
+      {
+        total: bucket(1_900, 820, 150, 24, 2_074),
+        last: bucket(1_900, 820, 150, 24, 2_074),
+      },
+      37,
+      72,
+    ),
+  ])
+
+  try {
+    const firstNow = Date.parse('2026-05-25T10:30:00.000Z')
+    const refreshNow = firstNow + 6_000
+    const first = await getUsageSummaryWithBackgroundScan({
+      codexHome,
+      dataDir,
+      now: firstNow,
+      writeHistory: false,
+      useCache: false,
+    })
+
+    await appendFile(
+      sessionPath,
+      `${tokenLine(
+        '2026-05-25T10:10:00.000Z',
+        {
+          total: bucket(2_700, 1_180, 190, 30, 2_920),
+          last: bucket(2_700, 1_180, 190, 30, 2_920),
+        },
+        39,
+        74,
+      )}\n`,
+      'utf8',
+    )
+
+    const startedAt = Date.now()
+    const stale = await getUsageSummaryWithBackgroundScan({
+      codexHome,
+      dataDir,
+      now: refreshNow,
+      writeHistory: false,
+      forceRefresh: true,
+      scanDelayMsForTests: 220,
+    })
+    const staleMs = Date.now() - startedAt
+
+    assert(staleMs < 220, 'expected stale snapshot before delayed refresh completes')
+    assert(stale.scanStatus.state === 'refreshing', 'expected refreshing scan status')
+    assert(stale.scanStatus.servedFromLastKnown, 'expected last-known snapshot marker')
+    assert(stale.source.eventsFound === first.source.eventsFound, 'expected stale event count before refresh')
+
+    const fresh = await waitForBackgroundSummary({
+      codexHome,
+      dataDir,
+      now: refreshNow + 1_000,
+      writeHistory: false,
+    })
+
+    assert(fresh.scanStatus.state === 'fresh', 'expected completed background refresh')
+    assert(fresh.source.filesIncremental === 1, 'expected appended bytes to use parser cache')
+    assert(fresh.source.eventsFound === 2, 'expected refreshed event count after append')
+    printSummary(
+      'background refresh serves last-known first',
+      true,
+      `stale ${staleMs}ms, final ${fresh.source.scanDurationMs}ms`,
+    )
+  } catch (error) {
+    printSummary('background refresh serves last-known first', false, error.message)
+  } finally {
+    await cleanup()
+  }
+}
+
+async function waitForBackgroundSummary(options) {
+  let summary = await getUsageSummaryWithBackgroundScan(options)
+  for (let attempt = 0; attempt < 14 && summary.scanStatus.state === 'refreshing'; attempt += 1) {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 25)
+    })
+    summary = await getUsageSummaryWithBackgroundScan(options)
+  }
+  return summary
+}
+
 async function run() {
   await runEmptyCodexScenario()
+  await runParserCacheScenario()
+  await runBackgroundRefreshScenario()
 
   await runScenario(
     'stale log file',

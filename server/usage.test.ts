@@ -9,11 +9,16 @@ import {
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { getUsageSummary } from './usage'
+import {
+  clearParserMemoryCacheForTests,
+  getUsageSummary,
+  getUsageSummaryWithBackgroundScan,
+} from './usage'
 
 const tempRoots: string[] = []
 
 afterEach(async () => {
+  clearParserMemoryCacheForTests()
   await Promise.all(
     tempRoots.map((root) => rm(root, { recursive: true, force: true })),
   )
@@ -752,10 +757,42 @@ describe('usage parser', () => {
     expect(first.source.filesFromCache).toBe(0)
     expect(second.source.filesParsed).toBe(0)
     expect(second.source.filesFromCache).toBe(1)
+    expect(second.source.filesFromMemoryCache).toBe(1)
+    expect(second.source.filesFromDiskCache).toBe(0)
     expect(second.source.eventsFound).toBe(first.source.eventsFound)
   })
 
-  it('invalidates parser cache when an append-only session grows', async () => {
+  it('reuses persistent parser cache after memory cache is cleared', async () => {
+    const { codexHome, dataDir } = await createFixture([
+      tokenLine('2026-05-25T10:00:00.000Z', 100, 20, 10, 5, 115, 30, 50),
+      tokenLine('2026-05-25T10:05:00.000Z', 350, 70, 20, 10, 380, 31, 51),
+      tokenLine('2026-05-25T10:10:00.000Z', 500, 90, 40, 12, 552, 32, 52),
+    ])
+
+    const first = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+    clearParserMemoryCacheForTests()
+    const second = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:31:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(first.source.filesParsed).toBe(1)
+    expect(second.source.filesParsed).toBe(0)
+    expect(second.source.filesFromCache).toBe(1)
+    expect(second.source.filesFromDiskCache).toBe(1)
+    expect(second.source.eventsFound).toBe(first.source.eventsFound)
+  })
+
+  it('parses only appended bytes when a complete append-only session grows', async () => {
     const { codexHome, dataDir, sessionPath } = await createFixture([
       tokenLine('2026-05-25T10:00:00.000Z', 100, 20, 10, 5, 115, 30, 50),
       tokenLine('2026-05-25T10:05:00.000Z', 350, 70, 20, 10, 380, 31, 51),
@@ -784,9 +821,101 @@ describe('usage parser', () => {
 
     expect(summary.source.filesParsed).toBe(1)
     expect(summary.source.filesFromCache).toBe(0)
+    expect(summary.source.filesIncremental).toBe(1)
     expect(summary.source.parseDiagnostics.tokenRecords).toBe(4)
     expect(summary.source.eventsFound).toBe(3)
     expect(summary.windows.lastHour.totalTokens).toBe(600)
+  })
+
+  it('serves last-known usage while a background refresh parses appended logs', async () => {
+    const { codexHome, dataDir, sessionPath } = await createFixture([
+      tokenLine('2026-05-25T10:00:00.000Z', 100, 20, 10, 5, 115, 30, 50),
+      tokenLine('2026-05-25T10:05:00.000Z', 350, 70, 20, 10, 380, 31, 51),
+    ])
+    const firstNow = Date.parse('2026-05-25T10:30:00.000Z')
+    const refreshNow = firstNow + 6_000
+
+    const first = await getUsageSummaryWithBackgroundScan({
+      codexHome,
+      dataDir,
+      now: firstNow,
+      writeHistory: false,
+      useCache: false,
+    })
+
+    await appendFile(
+      sessionPath,
+      `${tokenLine('2026-05-25T10:10:00.000Z', 500, 90, 40, 12, 552, 32, 52)}\n`,
+      'utf8',
+    )
+
+    const startedAt = Date.now()
+    const refreshing = await getUsageSummaryWithBackgroundScan({
+      codexHome,
+      dataDir,
+      now: refreshNow,
+      writeHistory: false,
+      forceRefresh: true,
+      scanDelayMsForTests: 180,
+    })
+    const elapsedMs = Date.now() - startedAt
+
+    expect(elapsedMs).toBeLessThan(180)
+    expect(refreshing.scanStatus.state).toBe('refreshing')
+    expect(refreshing.scanStatus.servedFromLastKnown).toBe(true)
+    expect(refreshing.source.eventsFound).toBe(first.source.eventsFound)
+
+    const fresh = await waitForBackgroundSummary({
+      codexHome,
+      dataDir,
+      now: refreshNow + 1_000,
+      writeHistory: false,
+    })
+
+    expect(fresh.scanStatus.state).toBe('fresh')
+    expect(fresh.source.filesIncremental).toBe(1)
+    expect(fresh.source.eventsFound).toBe(2)
+    expect(fresh.windows.lastHour.totalTokens).toBe(437)
+  })
+
+  it('invalidates persistent parser cache when a session log shrinks', async () => {
+    const { codexHome, dataDir, sessionPath } = await createFixture([
+      tokenLine('2026-05-25T10:00:00.000Z', 100, 20, 10, 5, 115, 30, 50),
+      tokenLine('2026-05-25T10:05:00.000Z', 350, 70, 20, 10, 380, 31, 51),
+      tokenLine('2026-05-25T10:10:00.000Z', 500, 90, 40, 12, 552, 32, 52),
+    ])
+
+    await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:30:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+    clearParserMemoryCacheForTests()
+    await writeFile(
+      sessionPath,
+      [
+        tokenLine('2026-05-25T10:00:00.000Z', 100, 20, 10, 5, 115, 30, 50),
+        tokenLine('2026-05-25T10:05:00.000Z', 160, 30, 20, 8, 188, 31, 51),
+      ].join('\n') + '\n',
+      'utf8',
+    )
+
+    const summary = await getUsageSummary({
+      codexHome,
+      dataDir,
+      now: Date.parse('2026-05-25T10:31:00.000Z'),
+      writeHistory: false,
+      useCache: false,
+    })
+
+    expect(summary.source.filesParsed).toBe(1)
+    expect(summary.source.filesIncremental).toBe(0)
+    expect(summary.source.cacheInvalidations).toBe(1)
+    expect(summary.source.cacheWarnings.join(' ')).toContain('log file shrank')
+    expect(summary.source.eventsFound).toBe(1)
+    expect(summary.windows.lastHour.totalTokens).toBe(73)
   })
 
   it('includes archived sessions in scan metrics and session totals', async () => {
@@ -953,6 +1082,23 @@ describe('projection confidence', () => {
     expect(summary.rates.weeklyPercent.percentPerHour).toBeNull()
   })
 })
+
+async function waitForBackgroundSummary(
+  options: Parameters<typeof getUsageSummaryWithBackgroundScan>[0],
+) {
+  let summary = await getUsageSummaryWithBackgroundScan(options)
+  for (let attempt = 0; attempt < 12 && summary.scanStatus.state === 'refreshing'; attempt += 1) {
+    await sleep(25)
+    summary = await getUsageSummaryWithBackgroundScan(options)
+  }
+  return summary
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
 
 async function createFixture(lines: string[], archivedLines: string[] = []) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'tokometer-'))

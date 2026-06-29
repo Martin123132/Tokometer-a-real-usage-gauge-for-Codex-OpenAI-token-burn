@@ -3,6 +3,7 @@
   "private": false,
   "version": "0.1.0",
   "description": "A real local usage gauge for Codex token burn, rate limits, history, alerts, and exports.",
+  "license": "SEE LICENSE IN LICENSE",
   "author": "Martin123132 <Martin123132@users.noreply.github.com>",
   "type": "module",
   "main": "electron/main.cjs",
@@ -70,7 +71,9 @@
       "public/**/*",
       "package.json",
       "README.md",
-      "LICENSE"
+      "LICENSE",
+      "NOTICE.md",
+      "COMMERCIAL-LICENSE.md"
     ],
     "win": {
       "icon": "build/icon.ico",

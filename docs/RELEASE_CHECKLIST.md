@@ -6,6 +6,11 @@ a portable build, SHA256 checksums, release notes, and a passing verification ru
 ## Before Packaging
 
 - Confirm the working tree is clean with `git status --short`.
+- Confirm `LICENSE`, `NOTICE.md`, `COMMERCIAL-LICENSE.md`, `README.md`, and
+  `package.json` preserve the PolyForm Noncommercial/source-available terms:
+  personal and non-commercial use only, commercial use requires a separate
+  written license from TWO HANDS NETWORK LTD, and licensing discussions route
+  through the COO of TWO HANDS NETWORK LTD.
 - Install from lockfile with `npm ci`.
 - Regenerate committed icon assets when changing branding with `npm run icons:generate`.
 - Run the standard gate:
@@ -63,4 +68,6 @@ npm run release:verify
 - Accuracy/parser changes.
 - UI/onboarding changes.
 - Known limitations, especially local-only visibility and visible app meter drift.
+- License reminder: personal/non-commercial use only; commercial use requires a
+  separate written license from TWO HANDS NETWORK LTD via the COO.
 - Upgrade notes if localStorage keys or diagnostics schema changed.

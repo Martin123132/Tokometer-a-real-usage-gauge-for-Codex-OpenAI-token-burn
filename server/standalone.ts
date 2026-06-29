@@ -3,7 +3,7 @@ import { stat } from 'node:fs/promises'
 import { createServer, type ServerResponse } from 'node:http'
 import { extname, join, normalize } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { getUsageSummary } from './usage'
+import { getUsageSummaryWithBackgroundScan } from './usage'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const distDir = join(root, 'dist')
@@ -31,7 +31,7 @@ const server = createServer(async (request, response) => {
   if (url.pathname === '/api/usage') {
     const anomalyPolicy = url.searchParams.get('anomalyPolicy') ?? undefined
     try {
-      sendJson(response, await getUsageSummary({ anomalyPolicy }))
+      sendJson(response, await getUsageSummaryWithBackgroundScan({ anomalyPolicy }))
     } catch (error) {
       response.statusCode = 500
       sendJson(response, {

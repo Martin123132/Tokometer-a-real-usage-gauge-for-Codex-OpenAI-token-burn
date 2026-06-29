@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
 type AnomalyPolicy = 'strict' | 'normal' | 'relaxed'
@@ -51,10 +51,24 @@ type TokenTotals = {
 
 type ConfidenceLevel = 'high' | 'medium' | 'low'
 
+type ScanState = 'cold' | 'fresh' | 'refreshing' | 'stale' | 'error'
+
 type DataConfidence = {
   level: ConfidenceLevel
   score: number
   reason: string
+}
+
+type ScanStatus = {
+  state: ScanState
+  servedFromLastKnown: boolean
+  lastCompletedAt: string | null
+  refreshStartedAt: string | null
+  refreshCompletedAt: string | null
+  lastSuccessfulScanDurationMs: number | null
+  ageMs: number | null
+  message: string
+  error: string | null
 }
 
 type ParseFileHealth = {
@@ -117,6 +131,11 @@ type UsageData = {
     scanDurationMs: number
     filesParsed: number
     filesFromCache: number
+    filesFromMemoryCache: number
+    filesFromDiskCache: number
+    filesIncremental: number
+    cacheInvalidations: number
+    cacheWarnings: string[]
     largestFileLines: number
     warnings: string[]
     eventsFound: number
@@ -126,6 +145,7 @@ type UsageData = {
     parseDiagnostics: ParseDiagnostics
     generatedAt: string
   }
+  scanStatus: ScanStatus
   latest: {
     timestamp: string | null
     sessionId: string | null
@@ -240,6 +260,7 @@ const diagnosticsSchema = 'tokometer-diagnostics-v1'
 
 function App() {
   const [data, setData] = useState<UsageData | null>(null)
+  const dataRef = useRef<UsageData | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [viewMode, setViewMode] = useState<ViewMode>('dashboard')
@@ -268,8 +289,14 @@ function App() {
     [calibrationHistory],
   )
 
+  useEffect(() => {
+    dataRef.current = data
+  }, [data])
+
   const refresh = useCallback(async () => {
-    setLoading(true)
+    if (!dataRef.current) {
+      setLoading(true)
+    }
     setError(null)
 
     try {
@@ -280,6 +307,7 @@ function App() {
         throw new Error(`Usage API returned ${response.status}`)
       }
       const payload = (await response.json()) as UsageData
+      dataRef.current = payload
       setData(payload)
     } catch (refreshError) {
       setError(
@@ -305,6 +333,15 @@ function App() {
   }, [settings.refreshSeconds, settings.anomalyPolicy, refresh])
 
   useEffect(() => {
+    if (data?.scanStatus.state !== 'refreshing') {
+      return undefined
+    }
+
+    const timer = window.setTimeout(() => void refresh(), 1_500)
+    return () => window.clearTimeout(timer)
+  }, [data?.scanStatus.state, data?.scanStatus.refreshStartedAt, refresh])
+
+  useEffect(() => {
     window.localStorage.setItem(settingsStorageKey, JSON.stringify(settings))
   }, [settings])
 
@@ -324,6 +361,7 @@ function App() {
     [data, visibleMeter, visiblePrimaryMeter, settings],
   )
   const staleAgeMinutes = data?.freshness.staleMinutes ?? null
+  const scanStatus = data?.scanStatus ?? null
   const projectionConfidence = data?.rates.weeklyPercent.confidence ?? null
   const hasLowConfidenceProjection =
     projectionConfidence !== null && projectionConfidence.level === 'low'
@@ -334,7 +372,11 @@ function App() {
   const staleByRefreshWindow =
     staleAgeMinutes !== null && staleAgeMinutes > staleRefreshWindowMinutes
   const hasSampleWarning =
-    (data?.freshness.stale ?? false) || staleByRefreshWindow || hasLowConfidenceProjection
+    (data?.freshness.stale ?? false) ||
+    staleByRefreshWindow ||
+    hasLowConfidenceProjection ||
+    scanStatus?.state === 'stale' ||
+    scanStatus?.state === 'error'
   const anomalyPolicyRecommendation = useMemo(
     () => recommendAnomalyPolicy(data),
     [data],
@@ -356,6 +398,15 @@ function App() {
 
   const qualityNotes = (() => {
     const items: string[] = []
+    if (scanStatus?.state === 'refreshing') {
+      items.push(scanStatus.message)
+    }
+    if (scanStatus?.state === 'error') {
+      items.push(`${scanStatus.message} ${scanStatus.error ?? ''}`.trim())
+    }
+    if (scanStatus?.state === 'stale') {
+      items.push(scanStatus.message)
+    }
     if (staleAgeMinutes !== null && staleByRefreshWindow) {
       items.push(
         `No fresh token events in the last ${Math.round(staleAgeMinutes)}m (refresh window ~${Math.round(staleRefreshWindowMinutes)}m).`,
@@ -502,6 +553,10 @@ function App() {
                 tone={systemHealth.tone}
                 label={systemHealth.label}
               />
+              <StatusPill
+                tone={scanStatusTone(data?.scanStatus)}
+                label={scanStatusLabel(data?.scanStatus)}
+              />
               {hasSampleWarning ? (
                 <StatusPill tone="warning" label="Sample Warning" />
               ) : null}
@@ -515,8 +570,9 @@ function App() {
           </div>
           <div className="topbar-actions">
             <div className="updated">
-              <span>Updated</span>
+              <span>{data?.scanStatus.state === 'refreshing' ? 'Scanning' : 'Updated'}</span>
               <strong>{formatTime(data?.source.generatedAt)}</strong>
+              <small>{formatScanAge(data?.scanStatus)}</small>
             </div>
             <button type="button" onClick={() => void refresh()}>
               Refresh
@@ -835,7 +891,7 @@ function SupportBundlePreview({
   const included = [
     `App metadata: Tokometer v${appVersion}, release channel, browser runtime.`,
     `Redacted paths: Codex home and history store with username removed.`,
-    `Scan metrics: ${data?.source.scanDurationMs ?? 0}ms, ${data?.source.filesScanned ?? 0} files, ${data?.source.filesFromCache ?? 0} from cache.`,
+    `Scan metrics: ${data?.source.scanDurationMs ?? 0}ms, ${data?.source.filesScanned ?? 0} files, ${data?.source.filesFromCache ?? 0} exact cache hits, ${data?.source.filesIncremental ?? 0} incremental parses.`,
     `Parser health: line counts, skipped non-token lines, malformed candidates, reset/anomaly counts.`,
     `Window summaries: token totals, observed minutes, rate confidence, freshness.`,
     `System checks: ${systemChecks.length} local readiness checks.`,
@@ -896,6 +952,7 @@ function SupportBundlePreview({
                 releaseChannel,
               },
               source: preview?.source ?? null,
+              scanStatus: preview?.scanStatus ?? null,
               parseDiagnostics: preview
                 ? {
                     parsedLines: preview.parseDiagnostics.parsedLines,
@@ -1386,6 +1443,58 @@ function StatusPill({
   return <span className={`status-pill ${tone}`}>{label}</span>
 }
 
+function scanStatusTone(status?: ScanStatus | null): 'known' | 'estimated' | 'warning' | 'danger' {
+  if (!status) {
+    return 'estimated'
+  }
+
+  if (status.state === 'error') {
+    return 'danger'
+  }
+
+  if (status.state === 'refreshing' || status.state === 'stale') {
+    return 'warning'
+  }
+
+  return 'known'
+}
+
+function scanStatusLabel(status?: ScanStatus | null): string {
+  if (!status) {
+    return 'Scan Pending'
+  }
+
+  if (status.state === 'refreshing') {
+    return 'Scanning Logs'
+  }
+
+  if (status.state === 'stale') {
+    return 'Last Known'
+  }
+
+  if (status.state === 'error') {
+    return 'Scan Error'
+  }
+
+  return 'Fresh Scan'
+}
+
+function formatScanAge(status?: ScanStatus | null): string {
+  if (!status || status.ageMs === null) {
+    return 'age unknown'
+  }
+
+  if (status.ageMs < 1_000) {
+    return 'just now'
+  }
+
+  if (status.ageMs < 60_000) {
+    return `${Math.round(status.ageMs / 1_000)}s old`
+  }
+
+  return `${Math.round(status.ageMs / 60_000)}m old`
+}
+
 function ConfidenceTile({
   label,
   value,
@@ -1744,6 +1853,7 @@ function AccuracyPanel({
   const primaryMetadataPercent = data?.limits.primary.usedPercent ?? 0
   const weeklyMetadataPercent = data?.limits.secondary.usedPercent ?? 0
   const freshness = data?.freshness
+  const scanStatus = data?.scanStatus
   const parseDiagnostics = data?.source.parseDiagnostics
   const lastHourConfidence = data?.windows.lastHour.confidence
   const lastFiveConfidence = data?.windows.lastFiveHours.confidence
@@ -1776,8 +1886,14 @@ function AccuracyPanel({
             detail={
               freshness?.latestEventAt
                 ? `At ${new Date(freshness.latestEventAt).toLocaleTimeString()}`
-                : 'No valid events'
+              : 'No valid events'
             }
+          />
+          <ConfidenceTile
+            label="Scan freshness"
+            value={scanStatusLabel(scanStatus)}
+            detail={scanStatus?.message ?? 'Waiting for first usage scan'}
+            footer={formatScanAge(scanStatus)}
           />
           <ConfidenceTile
             label="Last hour coverage"
@@ -1814,8 +1930,18 @@ function AccuracyPanel({
           <ConfidenceTile
             label="Scan time"
             value={`${data?.source.scanDurationMs ?? 0}ms`}
-            detail={`${data?.source.filesParsed ?? 0} parsed, ${data?.source.filesFromCache ?? 0} cached`}
+            detail={`${data?.source.filesParsed ?? 0} parsed, ${data?.source.filesFromCache ?? 0} exact cache, ${data?.source.filesIncremental ?? 0} incremental`}
             footer={`Largest file: ${(data?.source.largestFileLines ?? 0).toLocaleString()} lines`}
+          />
+          <ConfidenceTile
+            label="Parser cache"
+            value={`${data?.source.filesFromDiskCache ?? 0} disk`}
+            detail={`${data?.source.filesFromMemoryCache ?? 0} memory hits, ${data?.source.cacheInvalidations ?? 0} rebuilds`}
+            footer={
+              data?.source.cacheWarnings.length
+                ? data.source.cacheWarnings[0]
+                : 'Persistent cache healthy'
+            }
           />
           <ConfidenceTile
             label="Scan warnings"
@@ -2097,6 +2223,11 @@ function createDiagnosticsBundle(
       scanDurationMs: data.source.scanDurationMs,
       filesParsed: data.source.filesParsed,
       filesFromCache: data.source.filesFromCache,
+      filesFromMemoryCache: data.source.filesFromMemoryCache,
+      filesFromDiskCache: data.source.filesFromDiskCache,
+      filesIncremental: data.source.filesIncremental,
+      cacheInvalidations: data.source.cacheInvalidations,
+      cacheWarnings: data.source.cacheWarnings,
       largestFileLines: data.source.largestFileLines,
       warnings: data.source.warnings,
       eventsFound: data.source.eventsFound,
@@ -2105,6 +2236,7 @@ function createDiagnosticsBundle(
       ignoredEvents: data.source.ignoredEvents,
       generatedAt: data.source.generatedAt,
     },
+    scanStatus: data.scanStatus,
     limits: data.limits,
     windows: {
       lastHour: summarizeWindowForDiagnostics(data.windows.lastHour),
@@ -2155,7 +2287,8 @@ function createMarkdownReport(data: UsageData) {
     `Generated: ${data.source.generatedAt}`,
     `Codex home: ${data.source.codexHome}`,
     `History store: ${data.source.dataDir}`,
-    `Scan: ${data.source.scanDurationMs}ms; ${data.source.filesParsed} files parsed, ${data.source.filesFromCache} from cache, largest file ${data.source.largestFileLines} lines`,
+    `Scan status: ${scanStatusLabel(data.scanStatus)} - ${data.scanStatus.message}`,
+    `Scan: ${data.source.scanDurationMs}ms; ${data.source.filesParsed} files parsed, ${data.source.filesFromCache} exact cache hits, ${data.source.filesIncremental} incremental parses, largest file ${data.source.largestFileLines} lines`,
     '',
     '## Limits',
     '',
@@ -2167,6 +2300,7 @@ function createMarkdownReport(data: UsageData) {
     `- Parse lines: ${data.source.parseDiagnostics.parsedLines} parsed, ${data.source.parseDiagnostics.nonTokenLines} non-token, ${data.source.parseDiagnostics.malformedLines} malformed, ${data.source.parseDiagnostics.parseFailures} parse failures`,
     `- Ignored samples: ${data.source.parseDiagnostics.ignoredEvents} (${data.source.parseDiagnostics.resetEvents} resets, ${data.source.parseDiagnostics.anomalousDeltas} anomalies)`,
     `- Scan warnings: ${data.source.warnings.length ? data.source.warnings.join(' ') : 'None'}`,
+    `- Cache: ${data.source.filesFromMemoryCache} memory hits, ${data.source.filesFromDiskCache} disk hits, ${data.source.cacheInvalidations} invalidations`,
     '',
     '## Parse File Summary',
     ...fileSummaries.map((item) => `- ${item}`),
@@ -2473,7 +2607,7 @@ function buildSystemChecks(
           : data.source.scanDurationMs > 3_000 || data.source.warnings.length > 0
             ? 'warn'
             : 'pass',
-      detail: `${data.source.scanDurationMs}ms scan; ${data.source.filesFromCache}/${data.source.filesScanned} files reused from cache, largest file ${data.source.largestFileLines.toLocaleString()} lines.`,
+      detail: `${data.source.scanDurationMs}ms scan; ${data.source.filesFromCache}/${data.source.filesScanned} exact cache hits, ${data.source.filesIncremental} incremental parses, largest file ${data.source.largestFileLines.toLocaleString()} lines.`,
     },
     {
       id: 'freshness',

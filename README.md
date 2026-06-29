@@ -141,6 +141,7 @@ Known metadata:
 - Codex-provided token totals, cached input counts, output counts, reasoning counts, context window, rate-limit percentages, and reset timestamps when present.
 - Per-session cumulative deltas, so repeated `token_count` UI refreshes are not double-counted.
 - Parser scan timing, cache reuse count, largest file line count, and scan warnings.
+- Persistent parser cache under the Tokometer data folder, with append-only incremental parsing when session logs safely grow.
 
 Estimated or local:
 
@@ -219,4 +220,6 @@ See [docs/PRIVACY.md](docs/PRIVACY.md) for the diagnostics export policy.
 
 ## License
 
-PolyForm Noncommercial License 1.0.0. Commercial use requires a separate written license.
+PolyForm Noncommercial License 1.0.0. Personal and non-commercial use is permitted under that license.
+
+Commercial use requires a separate written license from TWO HANDS NETWORK LTD. To discuss commercial licensing, contact the COO of TWO HANDS NETWORK LTD. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) and [NOTICE.md](NOTICE.md).

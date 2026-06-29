@@ -20,4 +20,6 @@ Commercial license requests should include:
 - expected number of users or customers;
 - any requested changes to attribution, warranty, support, or redistribution terms.
 
+To discuss commercial licensing, contact the COO of TWO HANDS NETWORK LTD.
+
 No commercial license is granted unless agreed in writing by TWO HANDS NETWORK LTD.

@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import { getUsageSummary } from './server/usage'
+import { getUsageSummaryWithBackgroundScan } from './server/usage'
 
 // https://vite.dev/config/
 export default defineConfig({
@@ -21,7 +21,9 @@ export default defineConfig({
               undefined
             : undefined
           try {
-            const payload = await getUsageSummary({ anomalyPolicy })
+            const payload = await getUsageSummaryWithBackgroundScan({
+              anomalyPolicy,
+            })
             response.statusCode = 200
             response.setHeader('Content-Type', 'application/json')
             response.end(JSON.stringify(payload))

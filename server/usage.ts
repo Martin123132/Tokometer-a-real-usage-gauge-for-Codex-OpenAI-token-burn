@@ -1,11 +1,14 @@
 ﻿import { createReadStream } from 'node:fs'
+import { createHash } from 'node:crypto'
 import {
   access,
   appendFile,
+  open,
   mkdir,
   readdir,
   readFile,
   stat,
+  writeFile,
 } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
 import os from 'node:os'
@@ -15,6 +18,8 @@ const HISTORY_FILE = 'history.jsonl'
 const CACHE_TTL_MS = 5_000
 const HISTORY_KEEP_DAYS = 14
 const DEFAULT_ANOMALY_POLICY = 'normal'
+const PARSER_CACHE_DIR = 'parser-cache'
+const PARSER_CACHE_VERSION = 1
 
 type AnomalyPolicy = 'strict' | 'normal' | 'relaxed'
 
@@ -46,10 +51,24 @@ type SourceKind = 'sessions' | 'archived_sessions'
 
 type ConfidenceLevel = 'high' | 'medium' | 'low'
 
+export type ScanState = 'cold' | 'fresh' | 'refreshing' | 'stale' | 'error'
+
 type DataConfidence = {
   level: ConfidenceLevel
   score: number
   reason: string
+}
+
+export type ScanStatus = {
+  state: ScanState
+  servedFromLastKnown: boolean
+  lastCompletedAt: string | null
+  refreshStartedAt: string | null
+  refreshCompletedAt: string | null
+  lastSuccessfulScanDurationMs: number | null
+  ageMs: number | null
+  message: string
+  error: string | null
 }
 
 type ParseFileHealth = {
@@ -81,6 +100,11 @@ type ScanMetrics = {
   scanDurationMs: number
   filesParsed: number
   filesFromCache: number
+  filesFromMemoryCache: number
+  filesFromDiskCache: number
+  filesIncremental: number
+  cacheInvalidations: number
+  cacheWarnings: string[]
   largestFileLines: number
   warnings: string[]
 }
@@ -184,6 +208,11 @@ export type UsageSummary = {
     scanDurationMs: number
     filesParsed: number
     filesFromCache: number
+    filesFromMemoryCache: number
+    filesFromDiskCache: number
+    filesIncremental: number
+    cacheInvalidations: number
+    cacheWarnings: string[]
     largestFileLines: number
     warnings: string[]
     eventsFound: number
@@ -193,6 +222,7 @@ export type UsageSummary = {
     sessionsFound: number
     generatedAt: string
   }
+  scanStatus: ScanStatus
   latest: {
     timestamp: string | null
     sessionId: string | null
@@ -257,18 +287,161 @@ export type UsageOptions = {
   writeHistory?: boolean
   useCache?: boolean
   anomalyPolicy?: string
+  scanDelayMsForTests?: number
+}
+
+export type BackgroundUsageOptions = UsageOptions & {
+  allowStaleWhileRefreshing?: boolean
+  forceRefresh?: boolean
 }
 
 let cache: { key: string; expiresAt: number; value: UsageSummary } | null = null
+type BackgroundScanEntry = {
+  latest: UsageSummary | null
+  inFlight: Promise<void> | null
+  refreshStartedAt: number | null
+  lastError: string | null
+}
+type ParseMode = 'full' | 'incremental' | 'memory_cache' | 'disk_cache'
 type ParsedTokenEvents = {
   events: TokenEvent[]
   diagnostics: ParseFileHealth
   fromCache: boolean
+  parseMode: ParseMode
+  cacheInvalidated: boolean
+  cacheWarning: string | null
+  completeThroughBytes: number
+}
+type PersistentParseCache = {
+  version: number
+  filePath: string
+  source: SourceKind
+  sessionId: string
+  size: number
+  mtimeMs: number
+  completeThroughBytes: number
+  diagnostics: ParseFileHealth
+  events: TokenEvent[]
+  updatedAt: string
 }
 const fileCache = new Map<
   string,
   { mtimeMs: number; size: number; parsed: ParsedTokenEvents }
 >()
+const backgroundScans = new Map<string, BackgroundScanEntry>()
+
+export function clearParserMemoryCacheForTests(): void {
+  fileCache.clear()
+  backgroundScans.clear()
+  cache = null
+}
+
+export async function getUsageSummaryWithBackgroundScan(
+  options: BackgroundUsageOptions = {},
+): Promise<UsageSummary> {
+  const now = options.now ?? Date.now()
+  const codexHome = resolveCodexHome(options.codexHome)
+  const dataDir = resolveDataDir(options.dataDir)
+  const anomalyPolicy = resolveAnomalyPolicy(options.anomalyPolicy)
+  const cacheKey = usageSummaryCacheKey(
+    codexHome,
+    dataDir,
+    options.writeHistory ?? true,
+    anomalyPolicy,
+  )
+  let entry = backgroundScans.get(cacheKey)
+
+  if (!entry) {
+    entry = {
+      latest: null,
+      inFlight: null,
+      refreshStartedAt: null,
+      lastError: null,
+    }
+    backgroundScans.set(cacheKey, entry)
+  }
+
+  if (!entry.latest) {
+    if (entry.inFlight) {
+      await entry.inFlight
+      if (entry.latest) {
+        return withScanStatus(
+          entry.latest,
+          buildScanStatus(entry.latest, {
+            state: 'fresh',
+            now,
+            servedFromLastKnown: false,
+            message: 'Fresh scan completed.',
+          }),
+        )
+      }
+    }
+
+    const summary = await runForegroundBackgroundScan(entry, options)
+    return withScanStatus(
+      summary,
+      buildScanStatus(summary, {
+        state: 'fresh',
+        now,
+        servedFromLastKnown: false,
+        message: 'Initial scan completed.',
+      }),
+    )
+  }
+
+  const latestAgeMs = summaryAgeMs(entry.latest, now)
+  const shouldRefresh =
+    options.forceRefresh === true || latestAgeMs >= CACHE_TTL_MS
+  const allowStale = options.allowStaleWhileRefreshing !== false
+
+  if (shouldRefresh && !allowStale) {
+    return runForegroundBackgroundScan(entry, options)
+  }
+
+  if (shouldRefresh) {
+    startBackgroundScan(entry, options)
+  }
+
+  if (entry.inFlight) {
+    return withScanStatus(
+      entry.latest,
+      buildScanStatus(entry.latest, {
+        state: 'refreshing',
+        now,
+        servedFromLastKnown: true,
+        refreshStartedAt: entry.refreshStartedAt,
+        message: 'Showing last known usage while a fresh scan runs.',
+        error: entry.lastError,
+      }),
+    )
+  }
+
+  if (entry.lastError) {
+    return withScanStatus(
+      entry.latest,
+      buildScanStatus(entry.latest, {
+        state: 'error',
+        now,
+        servedFromLastKnown: true,
+        message: 'Showing last known usage because the latest scan failed.',
+        error: entry.lastError,
+      }),
+    )
+  }
+
+  return withScanStatus(
+    entry.latest,
+    buildScanStatus(entry.latest, {
+      state: latestAgeMs >= CACHE_TTL_MS ? 'stale' : 'fresh',
+      now,
+      servedFromLastKnown: latestAgeMs >= CACHE_TTL_MS,
+      message:
+        latestAgeMs >= CACHE_TTL_MS
+          ? 'Showing last known usage; next refresh will rescan logs.'
+          : 'Fresh scan is within the refresh cache window.',
+    }),
+  )
+}
 
 export async function getUsageSummary(
   options: UsageOptions = {},
@@ -277,10 +450,19 @@ export async function getUsageSummary(
   const codexHome = resolveCodexHome(options.codexHome)
   const dataDir = resolveDataDir(options.dataDir)
   const anomalyPolicy = resolveAnomalyPolicy(options.anomalyPolicy)
-  const cacheKey = `${codexHome}|${dataDir}|${options.writeHistory ?? true}|${anomalyPolicy}`
+  const cacheKey = usageSummaryCacheKey(
+    codexHome,
+    dataDir,
+    options.writeHistory ?? true,
+    anomalyPolicy,
+  )
 
   if (options.useCache !== false && cache && cache.key === cacheKey && cache.expiresAt > now) {
     return cache.value
+  }
+
+  if ((options.scanDelayMsForTests ?? 0) > 0) {
+    await delay(options.scanDelayMsForTests ?? 0)
   }
 
   const scanStartedAt = Date.now()
@@ -300,27 +482,43 @@ export async function getUsageSummary(
   )
 
   const files = filesBySource.flat()
+  const parserCacheDir = path.join(dataDir, PARSER_CACHE_DIR)
   const eventGroups = await Promise.all(
-    files.map(({ file, source }) => parseTokenEvents(file, source)),
+    files.map(({ file, source }) => parseTokenEvents(file, source, parserCacheDir)),
   )
   const parseDiagnostics = aggregateParseDiagnostics(eventGroups)
   const scanDurationMs = Math.max(0, Date.now() - scanStartedAt)
+  const largestFileLines = Math.max(
+    0,
+    ...eventGroups.map((group) => group.diagnostics.parsedLines),
+  )
+  const cacheWarnings = eventGroups.flatMap((group) =>
+    group.cacheWarning ? [group.cacheWarning] : [],
+  )
   const scanMetrics: ScanMetrics = {
     scanDurationMs,
-    filesParsed: eventGroups.filter((group) => !group.fromCache).length,
+    filesParsed: eventGroups.filter(
+      (group) => group.parseMode === 'full' || group.parseMode === 'incremental',
+    ).length,
     filesFromCache: eventGroups.filter((group) => group.fromCache).length,
-    largestFileLines: Math.max(
-      0,
-      ...eventGroups.map((group) => group.diagnostics.parsedLines),
-    ),
+    filesFromMemoryCache: eventGroups.filter(
+      (group) => group.parseMode === 'memory_cache',
+    ).length,
+    filesFromDiskCache: eventGroups.filter(
+      (group) => group.parseMode === 'disk_cache',
+    ).length,
+    filesIncremental: eventGroups.filter(
+      (group) => group.parseMode === 'incremental',
+    ).length,
+    cacheInvalidations: eventGroups.filter((group) => group.cacheInvalidated).length,
+    cacheWarnings,
+    largestFileLines,
     warnings: buildScanWarnings({
       scanDurationMs,
       filesScanned: files.length,
       parseDiagnostics,
-      largestFileLines: Math.max(
-        0,
-        ...eventGroups.map((group) => group.diagnostics.parsedLines),
-      ),
+      largestFileLines,
+      cacheWarnings,
     }),
   }
   const events = eventGroups
@@ -354,6 +552,163 @@ export async function getUsageSummary(
   }
 
   return summary
+}
+
+function startBackgroundScan(
+  entry: BackgroundScanEntry,
+  options: BackgroundUsageOptions,
+): void {
+  if (entry.inFlight) {
+    return
+  }
+
+  const refreshStartedAt = Date.now()
+  entry.refreshStartedAt = refreshStartedAt
+  entry.inFlight = (async () => {
+    try {
+      const scanOptions = toUsageOptions({
+        ...options,
+        useCache: false,
+      })
+      const summary = await getUsageSummary(scanOptions)
+      const completedAt = Date.now()
+      entry.latest = withScanStatus(
+        summary,
+        buildScanStatus(summary, {
+          state: 'fresh',
+          now: scanOptions.now ?? completedAt,
+          servedFromLastKnown: false,
+          refreshStartedAt,
+          refreshCompletedAt: completedAt,
+          message: 'Fresh background scan completed.',
+        }),
+      )
+      entry.lastError = null
+    } catch (error) {
+      entry.lastError = formatScanError(error)
+    } finally {
+      entry.refreshStartedAt = null
+      entry.inFlight = null
+    }
+  })()
+}
+
+async function runForegroundBackgroundScan(
+  entry: BackgroundScanEntry,
+  options: BackgroundUsageOptions,
+): Promise<UsageSummary> {
+  const refreshStartedAt = Date.now()
+  const scanOptions = toUsageOptions(options)
+  entry.refreshStartedAt = refreshStartedAt
+
+  try {
+    const summary = await getUsageSummary(scanOptions)
+    const completedAt = Date.now()
+    const stored = withScanStatus(
+      summary,
+      buildScanStatus(summary, {
+        state: 'fresh',
+        now: scanOptions.now ?? completedAt,
+        servedFromLastKnown: false,
+        refreshStartedAt,
+        refreshCompletedAt: completedAt,
+        message: 'Fresh scan completed.',
+      }),
+    )
+    entry.latest = stored
+    entry.lastError = null
+    return stored
+  } catch (error) {
+    entry.lastError = formatScanError(error)
+    throw error
+  } finally {
+    entry.refreshStartedAt = null
+  }
+}
+
+function toUsageOptions(options: BackgroundUsageOptions): UsageOptions {
+  return {
+    codexHome: options.codexHome,
+    dataDir: options.dataDir,
+    now: options.now,
+    writeHistory: options.writeHistory,
+    useCache: options.useCache,
+    anomalyPolicy: options.anomalyPolicy,
+    scanDelayMsForTests: options.scanDelayMsForTests,
+  }
+}
+
+function usageSummaryCacheKey(
+  codexHome: string,
+  dataDir: string,
+  writeHistory: boolean,
+  anomalyPolicy: AnomalyPolicy,
+): string {
+  return `${codexHome}|${dataDir}|${writeHistory}|${anomalyPolicy}`
+}
+
+function withScanStatus(
+  summary: UsageSummary,
+  scanStatus: ScanStatus,
+): UsageSummary {
+  return {
+    ...summary,
+    scanStatus,
+  }
+}
+
+function buildScanStatus(
+  summary: UsageSummary,
+  options: {
+    state: ScanState
+    now: number
+    servedFromLastKnown: boolean
+    refreshStartedAt?: number | null
+    refreshCompletedAt?: number | null
+    message: string
+    error?: string | null
+  },
+): ScanStatus {
+  const refreshCompletedAt =
+    toIso(options.refreshCompletedAt) ??
+    summary.scanStatus.refreshCompletedAt ??
+    summary.source.generatedAt
+
+  return {
+    state: options.state,
+    servedFromLastKnown: options.servedFromLastKnown,
+    lastCompletedAt:
+      summary.scanStatus.lastCompletedAt ?? summary.source.generatedAt,
+    refreshStartedAt: toIso(options.refreshStartedAt),
+    refreshCompletedAt,
+    lastSuccessfulScanDurationMs:
+      summary.scanStatus.lastSuccessfulScanDurationMs ??
+      summary.source.scanDurationMs,
+    ageMs: summaryAgeMs(summary, options.now),
+    message: options.message,
+    error: options.error ?? null,
+  }
+}
+
+function summaryAgeMs(summary: UsageSummary, now: number): number {
+  const generatedAtMs = Date.parse(summary.source.generatedAt)
+  return Number.isFinite(generatedAtMs) ? Math.max(0, now - generatedAtMs) : 0
+}
+
+function toIso(timestampMs?: number | null): string | null {
+  return typeof timestampMs === 'number'
+    ? new Date(timestampMs).toISOString()
+    : null
+}
+
+function formatScanError(error: unknown): string {
+  return error instanceof Error ? error.message : 'Usage scan failed'
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
 }
 
 export function resolveCodexHome(explicit?: string): string {
@@ -420,20 +775,142 @@ export async function listJsonlFiles(root: string): Promise<string[]> {
 async function parseTokenEvents(
   filePath: string,
   source: SourceKind,
+  cacheDir: string,
 ): Promise<ParsedTokenEvents> {
   const fileStat = await stat(filePath)
   const cached = fileCache.get(filePath)
+  const sessionId = path.basename(filePath, '.jsonl').replace(/^rollout-/, '')
 
   if (
     cached &&
     cached.mtimeMs === fileStat.mtimeMs &&
     cached.size === fileStat.size
   ) {
-    return { ...cached.parsed, fromCache: true }
+    return {
+      ...cached.parsed,
+      fromCache: true,
+      parseMode: 'memory_cache',
+      cacheInvalidated: false,
+      cacheWarning: null,
+    }
   }
 
-  const sessionId = path.basename(filePath, '.jsonl').replace(/^rollout-/, '')
-  const stream = createReadStream(filePath, { encoding: 'utf8' })
+  const cachePath = parserCachePath(cacheDir, filePath, source)
+  const persistent = await readPersistentParseCache(cachePath, {
+    filePath,
+    source,
+    sessionId,
+  })
+  const regressionWarning = cacheRegressionWarning(persistent.cache, fileStat)
+  const cacheWarning = persistent.warning ?? regressionWarning
+  const cacheInvalidated = persistent.invalidated || regressionWarning !== null
+
+  if (
+    persistent.cache &&
+    !regressionWarning &&
+    persistent.cache.mtimeMs === fileStat.mtimeMs &&
+    persistent.cache.size === fileStat.size
+  ) {
+    const parsed = parsedFromPersistentCache(
+      persistent.cache,
+      'disk_cache',
+      cacheWarning,
+    )
+    fileCache.set(filePath, {
+      mtimeMs: fileStat.mtimeMs,
+      size: fileStat.size,
+      parsed,
+    })
+    return parsed
+  }
+
+  const base = chooseIncrementalBase(cached, persistent.cache, fileStat)
+  if (base) {
+    const appended = await parseTokenEventRange(
+      filePath,
+      source,
+      sessionId,
+      base.completeThroughBytes,
+    )
+    const completeThroughBytes = await completeThroughBytesForFile(
+      filePath,
+      fileStat.size,
+    )
+    const parsed: ParsedTokenEvents = {
+      events: [...base.events, ...appended.events],
+      diagnostics: mergeFileDiagnostics(base.diagnostics, appended.diagnostics),
+      fromCache: false,
+      parseMode: 'incremental',
+      cacheInvalidated: false,
+      cacheWarning,
+      completeThroughBytes,
+    }
+
+    fileCache.set(filePath, {
+      mtimeMs: fileStat.mtimeMs,
+      size: fileStat.size,
+      parsed,
+    })
+    await writePersistentParseCache(cachePath, {
+      version: PARSER_CACHE_VERSION,
+      filePath,
+      source,
+      sessionId,
+      size: fileStat.size,
+      mtimeMs: fileStat.mtimeMs,
+      completeThroughBytes,
+      diagnostics: parsed.diagnostics,
+      events: parsed.events,
+      updatedAt: new Date().toISOString(),
+    })
+    return parsed
+  }
+
+  const parsedRange = await parseTokenEventRange(filePath, source, sessionId)
+  const completeThroughBytes = await completeThroughBytesForFile(
+    filePath,
+    fileStat.size,
+  )
+  const parsed: ParsedTokenEvents = {
+    ...parsedRange,
+    fromCache: false,
+    parseMode: 'full',
+    cacheInvalidated,
+    cacheWarning,
+    completeThroughBytes,
+  }
+
+  fileCache.set(filePath, {
+    mtimeMs: fileStat.mtimeMs,
+    size: fileStat.size,
+    parsed,
+  })
+  await writePersistentParseCache(cachePath, {
+    version: PARSER_CACHE_VERSION,
+    filePath,
+    source,
+    sessionId,
+    size: fileStat.size,
+    mtimeMs: fileStat.mtimeMs,
+    completeThroughBytes,
+    diagnostics: parsed.diagnostics,
+    events: parsed.events,
+    updatedAt: new Date().toISOString(),
+  })
+
+  return parsed
+}
+
+async function parseTokenEventRange(
+  filePath: string,
+  source: SourceKind,
+  sessionId: string,
+  start?: number,
+): Promise<{ events: TokenEvent[]; diagnostics: ParseFileHealth }> {
+  const stream = createReadStream(filePath, {
+    encoding: 'utf8',
+    ...(start && start > 0 ? { start } : {}),
+  })
   const reader = createInterface({ input: stream, crlfDelay: Infinity })
   const diagnostics: ParseFileHealth = {
     file: filePath,
@@ -515,19 +992,233 @@ async function parseTokenEvents(
     }
   }
 
-  const parsed: ParsedTokenEvents = {
+  return {
     events,
     diagnostics,
-    fromCache: false,
+  }
+}
+
+function parserCachePath(cacheDir: string, filePath: string, source: SourceKind): string {
+  const hash = createHash('sha256')
+    .update(`${source}\0${path.resolve(filePath)}`)
+    .digest('hex')
+  return path.join(cacheDir, `${hash}.json`)
+}
+
+async function readPersistentParseCache(
+  cachePath: string,
+  expected: { filePath: string; source: SourceKind; sessionId: string },
+): Promise<{
+  cache: PersistentParseCache | null
+  warning: string | null
+  invalidated: boolean
+}> {
+  try {
+    const parsed = JSON.parse(await readFile(cachePath, 'utf8')) as Partial<PersistentParseCache>
+    const warningPrefix = `Parser cache ${path.basename(cachePath)}`
+
+    if (parsed.version !== PARSER_CACHE_VERSION) {
+      return {
+        cache: null,
+        warning: `${warningPrefix} format changed; rebuilt from source log.`,
+        invalidated: true,
+      }
+    }
+
+    if (
+      parsed.filePath !== expected.filePath ||
+      parsed.source !== expected.source ||
+      parsed.sessionId !== expected.sessionId ||
+      !Array.isArray(parsed.events) ||
+      !isParseFileHealth(parsed.diagnostics) ||
+      typeof parsed.size !== 'number' ||
+      typeof parsed.mtimeMs !== 'number' ||
+      typeof parsed.completeThroughBytes !== 'number'
+    ) {
+      return {
+        cache: null,
+        warning: `${warningPrefix} metadata mismatch; rebuilt from source log.`,
+        invalidated: true,
+      }
+    }
+
+    return {
+      cache: parsed as PersistentParseCache,
+      warning: null,
+      invalidated: false,
+    }
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return { cache: null, warning: null, invalidated: false }
+    }
+
+    return {
+      cache: null,
+      warning: `Parser cache ${path.basename(cachePath)} could not be read; rebuilt from source log.`,
+      invalidated: true,
+    }
+  }
+}
+
+function parsedFromPersistentCache(
+  cache: PersistentParseCache,
+  parseMode: ParseMode,
+  warning: string | null,
+): ParsedTokenEvents {
+  return {
+    events: cache.events,
+    diagnostics: cache.diagnostics,
+    fromCache: parseMode === 'disk_cache',
+    parseMode,
+    cacheInvalidated: false,
+    cacheWarning: warning,
+    completeThroughBytes: cache.completeThroughBytes,
+  }
+}
+
+function chooseIncrementalBase(
+  memoryCache:
+    | { mtimeMs: number; size: number; parsed: ParsedTokenEvents }
+    | undefined,
+  persistentCache: PersistentParseCache | null,
+  fileStat: { mtimeMs: number; size: number },
+): (ParsedTokenEvents & { size: number; mtimeMs: number }) | null {
+  const memoryBase =
+    memoryCache &&
+    canUseIncrementalBase(
+      {
+        mtimeMs: memoryCache.mtimeMs,
+        size: memoryCache.size,
+        completeThroughBytes: memoryCache.parsed.completeThroughBytes,
+      },
+      fileStat,
+    )
+      ? {
+          ...memoryCache.parsed,
+          size: memoryCache.size,
+          mtimeMs: memoryCache.mtimeMs,
+        }
+      : null
+
+  if (memoryBase) {
+    return memoryBase
   }
 
-  fileCache.set(filePath, {
-    mtimeMs: fileStat.mtimeMs,
-    size: fileStat.size,
-    parsed,
-  })
+  if (persistentCache && canUseIncrementalBase(persistentCache, fileStat)) {
+    return {
+      ...parsedFromPersistentCache(persistentCache, 'disk_cache', null),
+      size: persistentCache.size,
+      mtimeMs: persistentCache.mtimeMs,
+    }
+  }
 
-  return parsed
+  return null
+}
+
+function canUseIncrementalBase(
+  cache: { mtimeMs: number; size: number; completeThroughBytes?: number },
+  fileStat: { mtimeMs: number; size: number },
+): boolean {
+  return (
+    fileStat.size > cache.size &&
+    fileStat.mtimeMs >= cache.mtimeMs &&
+    cache.completeThroughBytes === cache.size
+  )
+}
+
+function cacheRegressionWarning(
+  cache: PersistentParseCache | null,
+  fileStat: { mtimeMs: number; size: number },
+): string | null {
+  if (!cache) {
+    return null
+  }
+
+  if (fileStat.size < cache.size) {
+    return `Parser cache for ${path.basename(cache.filePath)} was invalidated because the log file shrank.`
+  }
+
+  if (fileStat.mtimeMs < cache.mtimeMs) {
+    return `Parser cache for ${path.basename(cache.filePath)} was invalidated because the log timestamp moved backward.`
+  }
+
+  return null
+}
+
+function mergeFileDiagnostics(
+  base: ParseFileHealth,
+  next: ParseFileHealth,
+): ParseFileHealth {
+  return {
+    file: base.file,
+    parsedLines: base.parsedLines + next.parsedLines,
+    nonTokenLines: base.nonTokenLines + next.nonTokenLines,
+    malformedLines: base.malformedLines + next.malformedLines,
+    parseFailures: base.parseFailures + next.parseFailures,
+    tokenRecords: base.tokenRecords + next.tokenRecords,
+    usedEvents: base.usedEvents + next.usedEvents,
+    fallbackTokenSourceUsed:
+      base.fallbackTokenSourceUsed + next.fallbackTokenSourceUsed,
+  }
+}
+
+async function completeThroughBytesForFile(
+  filePath: string,
+  size: number,
+): Promise<number> {
+  if (size <= 0) {
+    return 0
+  }
+
+  let fileHandle: Awaited<ReturnType<typeof open>> | null = null
+  try {
+    fileHandle = await open(filePath, 'r')
+    const buffer = Buffer.alloc(1)
+    await fileHandle.read(buffer, 0, 1, size - 1)
+    return buffer[0] === 0x0a || buffer[0] === 0x0d ? size : 0
+  } catch {
+    return 0
+  } finally {
+    await fileHandle?.close()
+  }
+}
+
+async function writePersistentParseCache(
+  cachePath: string,
+  payload: PersistentParseCache,
+): Promise<void> {
+  try {
+    await mkdir(path.dirname(cachePath), { recursive: true })
+    await writeFile(cachePath, JSON.stringify(payload), 'utf8')
+  } catch {
+    // Persistent cache is a performance feature only; parsing results remain valid without it.
+  }
+}
+
+function isParseFileHealth(value: unknown): value is ParseFileHealth {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+  const candidate = value as Partial<ParseFileHealth>
+  return (
+    typeof candidate.file === 'string' &&
+    typeof candidate.parsedLines === 'number' &&
+    typeof candidate.nonTokenLines === 'number' &&
+    typeof candidate.malformedLines === 'number' &&
+    typeof candidate.parseFailures === 'number' &&
+    typeof candidate.tokenRecords === 'number' &&
+    typeof candidate.usedEvents === 'number' &&
+    typeof candidate.fallbackTokenSourceUsed === 'number'
+  )
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: unknown }).code === 'ENOENT'
+  )
 }
 
 function aggregateParseDiagnostics(
@@ -561,11 +1252,13 @@ function buildScanWarnings({
   filesScanned,
   parseDiagnostics,
   largestFileLines,
+  cacheWarnings,
 }: {
   scanDurationMs: number
   filesScanned: number
   parseDiagnostics: ParseDiagnostics
   largestFileLines: number
+  cacheWarnings: string[]
 }): string[] {
   const warnings: string[] = []
 
@@ -603,6 +1296,8 @@ function buildScanWarnings({
       'Token candidate parse quality is degraded; diagnostics can help file a parser bug without exporting raw logs.',
     )
   }
+
+  cacheWarnings.slice(0, 3).forEach((warning) => warnings.push(warning))
 
   return warnings
 }
@@ -658,6 +1353,11 @@ function buildSummary(
       scanDurationMs: scanMetrics.scanDurationMs,
       filesParsed: scanMetrics.filesParsed,
       filesFromCache: scanMetrics.filesFromCache,
+      filesFromMemoryCache: scanMetrics.filesFromMemoryCache,
+      filesFromDiskCache: scanMetrics.filesFromDiskCache,
+      filesIncremental: scanMetrics.filesIncremental,
+      cacheInvalidations: scanMetrics.cacheInvalidations,
+      cacheWarnings: scanMetrics.cacheWarnings,
       largestFileLines: scanMetrics.largestFileLines,
       warnings: scanMetrics.warnings,
       eventsFound: usageEvents.length,
@@ -671,6 +1371,17 @@ function buildSummary(
         anomalousDeltas: parseDiagnostics.anomalousDeltas + usageBuild.anomalousDeltas,
       },
       generatedAt: new Date(now).toISOString(),
+    },
+    scanStatus: {
+      state: 'fresh',
+      servedFromLastKnown: false,
+      lastCompletedAt: new Date(now).toISOString(),
+      refreshStartedAt: null,
+      refreshCompletedAt: new Date(now).toISOString(),
+      lastSuccessfulScanDurationMs: scanMetrics.scanDurationMs,
+      ageMs: 0,
+      message: 'Fresh scan completed.',
+      error: null,
     },
     latest: {
       timestamp: latest?.timestamp ?? null,
@@ -725,6 +1436,7 @@ function buildSummary(
         'Reads Codex token_count events from local session JSONL logs.',
         `Observed ${usageEvents.length.toLocaleString()} deduplicated local deltas from ${parseDiagnostics.tokenRecords.toLocaleString()} token events.`,
         `Scanned ${filesScanned.toLocaleString()} JSONL files in ${scanMetrics.scanDurationMs}ms (${scanMetrics.filesFromCache.toLocaleString()} reused from parser cache).`,
+        `Parser cache: ${scanMetrics.filesFromMemoryCache.toLocaleString()} memory hits, ${scanMetrics.filesFromDiskCache.toLocaleString()} disk hits, ${scanMetrics.filesIncremental.toLocaleString()} append-only incremental parses.`,
         parseDiagnostics.fallbackTokenSourceUsed > 0
           ? `${parseDiagnostics.fallbackTokenSourceUsed.toLocaleString()} records used last_token_usage fallback when total_token_usage was missing.`
           : 'Uses total_token_usage as the primary cumulative counter.',
@@ -745,6 +1457,9 @@ function buildSummary(
         scanMetrics.warnings.length > 0
           ? `Scan warnings: ${scanMetrics.warnings.join(' ')}`
           : 'No scan performance warnings were emitted.',
+        scanMetrics.cacheInvalidations > 0
+          ? `${scanMetrics.cacheInvalidations} parser cache entries were invalidated and rebuilt.`
+          : 'Persistent parser cache entries were reusable or safely bypassed.',
         `Observed deltas were filtered for counter resets (${parseDiagnostics.resetEvents}) and likely anomalies (${parseDiagnostics.anomalousDeltas}).`,
         `Anomaly policy is set to '${anomalyPolicy}' when classifying suspect token deltas.`,
       ],

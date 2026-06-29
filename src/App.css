@@ -184,6 +184,11 @@
   font-size: 14px;
 }
 
+.updated small {
+  color: #8fa2b3;
+  font-size: 11px;
+}
+
 button {
   min-height: 42px;
   border: 1px solid rgba(55, 214, 255, 0.36);
